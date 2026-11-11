@@ -13,7 +13,7 @@ Parameters:
   ClientCidr:
     Type: String
     Description: >
-      CIDR allowed to reach the Neo4j browser (7474) and Bolt (7687)
+      CIDR allowed to reach the Neo4j browser (7474) and Bolt (8443)
       directly, e.g. the VPC CIDR or a VPN/WARP range.
 
 Resources:
@@ -22,7 +22,7 @@ Resources:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupName: cartography-neo4j-sg
-      GroupDescription: Neo4j - allows browser from ALB and Bolt from Cartography
+      GroupDescription: Neo4j - browser and Bolt from ClientCidr and the loaders
       VpcId: !Ref VpcId
       Tags:
         - Key: Name
@@ -48,8 +48,8 @@ Resources:
     Properties:
       GroupId: !Ref Neo4jSecurityGroup
       IpProtocol: tcp
-      FromPort: 7687
-      ToPort: 7687
+      FromPort: 8443
+      ToPort: 8443
       CidrIp: !Ref ClientCidr
       Description: Bolt from VPC (WARP)
 
