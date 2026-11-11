@@ -160,7 +160,7 @@ Resources:
   LambdaExecutionRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: cartography-lambda-loader-role
+      RoleName: !Sub "cartography-lambda-loader-role-${AWS::Region}"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -274,7 +274,7 @@ Resources:
   StateMachineRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: cartography-lambda-statemachine-role
+      RoleName: !Sub "cartography-lambda-statemachine-role-${AWS::Region}"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -549,7 +549,7 @@ Resources:
   OrchestratorStateMachineRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: cartography-lambda-orchestrator-role
+      RoleName: !Sub "cartography-lambda-orchestrator-role-${AWS::Region}"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:

@@ -75,7 +75,7 @@ Resources:
   LambdaExecutionRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: cartography-anthropic-lambda-loader-role
+      RoleName: !Sub "cartography-anthropic-lambda-loader-role-${AWS::Region}"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -142,7 +142,7 @@ Resources:
   StateMachineRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: cartography-anthropic-lambda-statemachine-role
+      RoleName: !Sub "cartography-anthropic-lambda-statemachine-role-${AWS::Region}"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -237,7 +237,7 @@ Resources:
   SchedulerRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: cartography-anthropic-lambda-scheduler-role
+      RoleName: !Sub "cartography-anthropic-lambda-scheduler-role-${AWS::Region}"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:

@@ -74,7 +74,7 @@ Resources:
   LambdaExecutionRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: cartography-ontology-lambda-loader-role
+      RoleName: !Sub "cartography-ontology-lambda-loader-role-${AWS::Region}"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -135,7 +135,7 @@ Resources:
   StateMachineRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: cartography-ontology-lambda-statemachine-role
+      RoleName: !Sub "cartography-ontology-lambda-statemachine-role-${AWS::Region}"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -230,7 +230,7 @@ Resources:
   SchedulerRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: cartography-ontology-lambda-scheduler-role
+      RoleName: !Sub "cartography-ontology-lambda-scheduler-role-${AWS::Region}"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:

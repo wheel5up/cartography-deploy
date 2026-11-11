@@ -139,7 +139,7 @@ Resources:
   LambdaExecutionRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: cartography-cloudflare-lambda-loader-role
+      RoleName: !Sub "cartography-cloudflare-lambda-loader-role-${AWS::Region}"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -220,7 +220,7 @@ Resources:
   StateMachineRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: cartography-cloudflare-lambda-statemachine-role
+      RoleName: !Sub "cartography-cloudflare-lambda-statemachine-role-${AWS::Region}"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -453,7 +453,7 @@ Resources:
   CartographyCloudflareLambdaOrchestratorRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: cartography-cloudflare-lambda-orchestrator-role
+      RoleName: !Sub "cartography-cloudflare-lambda-orchestrator-role-${AWS::Region}"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -705,7 +705,7 @@ Resources:
   CloudflareLambdaSchedulerRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: cartography-cloudflare-lambda-scheduler-role
+      RoleName: !Sub "cartography-cloudflare-lambda-scheduler-role-${AWS::Region}"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:

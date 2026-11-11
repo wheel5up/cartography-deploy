@@ -8,7 +8,7 @@ an AWS STS GetCallerIdentity request with this Lambda's role credentials
 (AWS_ACCESS_KEY_ID/SECRET/SESSION_TOKEN env vars, which Lambda provides),
 exchanges it at sts.googleapis.com for a federated token, then impersonates
 GCP_SERVICE_ACCOUNT. The pool provider only accepts the
-cartography-gcp-lambda-loader-role assumed-role ARN. Nothing secret is stored
+cartography-gcp-lambda-loader-role-<region> assumed-role ARN. Nothing secret is stored
 anywhere; GCP_WIF_AUDIENCE and GCP_SERVICE_ACCOUNT are identifiers.
 
 If GCP_WIF_AUDIENCE is unset (local runs), Application Default Credentials are

@@ -154,7 +154,7 @@ Resources:
   LambdaExecutionRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: cartography-okta-lambda-loader-role
+      RoleName: !Sub "cartography-okta-lambda-loader-role-${AWS::Region}"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -237,7 +237,7 @@ Resources:
   StateMachineRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: cartography-okta-lambda-statemachine-role
+      RoleName: !Sub "cartography-okta-lambda-statemachine-role-${AWS::Region}"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -494,7 +494,7 @@ Resources:
   CartographyOktaLambdaOrchestratorRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: cartography-okta-lambda-orchestrator-role
+      RoleName: !Sub "cartography-okta-lambda-orchestrator-role-${AWS::Region}"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -787,7 +787,7 @@ Resources:
   OktaLambdaSchedulerRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: cartography-okta-lambda-scheduler-role
+      RoleName: !Sub "cartography-okta-lambda-scheduler-role-${AWS::Region}"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:

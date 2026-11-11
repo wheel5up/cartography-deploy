@@ -83,7 +83,7 @@ Resources:
   LambdaExecutionRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: cartography-github-lambda-loader-role
+      RoleName: !Sub "cartography-github-lambda-loader-role-${AWS::Region}"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -169,7 +169,7 @@ Resources:
   StateMachineRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: cartography-github-lambda-statemachine-role
+      RoleName: !Sub "cartography-github-lambda-statemachine-role-${AWS::Region}"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -207,7 +207,7 @@ Resources:
   OrchestratorRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: cartography-github-lambda-orchestrator-role
+      RoleName: !Sub "cartography-github-lambda-orchestrator-role-${AWS::Region}"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -724,7 +724,7 @@ Resources:
   SchedulerRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: cartography-github-lambda-scheduler-role
+      RoleName: !Sub "cartography-github-lambda-scheduler-role-${AWS::Region}"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:

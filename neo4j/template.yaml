@@ -87,7 +87,7 @@ Resources:
   Neo4jInstanceRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: cartography-neo4j-role
+      RoleName: !Sub "cartography-neo4j-role-${AWS::Region}"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -119,7 +119,7 @@ Resources:
   Neo4jInstanceProfile:
     Type: AWS::IAM::InstanceProfile
     Properties:
-      InstanceProfileName: cartography-neo4j-profile
+      InstanceProfileName: !Sub "cartography-neo4j-profile-${AWS::Region}"
       Roles:
         - !Ref Neo4jInstanceRole
 

@@ -144,7 +144,7 @@ Resources:
   LambdaExecutionRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: cartography-vercel-lambda-loader-role
+      RoleName: !Sub "cartography-vercel-lambda-loader-role-${AWS::Region}"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -232,7 +232,7 @@ Resources:
   StateMachineRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: cartography-vercel-lambda-statemachine-role
+      RoleName: !Sub "cartography-vercel-lambda-statemachine-role-${AWS::Region}"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -482,7 +482,7 @@ Resources:
   CartographyVercelLambdaOrchestratorRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: cartography-vercel-lambda-orchestrator-role
+      RoleName: !Sub "cartography-vercel-lambda-orchestrator-role-${AWS::Region}"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -747,7 +747,7 @@ Resources:
   VercelLambdaSchedulerRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: cartography-vercel-lambda-scheduler-role
+      RoleName: !Sub "cartography-vercel-lambda-scheduler-role-${AWS::Region}"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:

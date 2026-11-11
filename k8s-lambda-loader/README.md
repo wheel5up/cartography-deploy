@@ -35,7 +35,7 @@ cluster failed, so failures can't hide behind a green execution.
 
 **Other details:**
 - **update_tag:** one per cluster. All k8s cleanups are scoped by `CLUSTER_ID`.
-- **Lambda role:** `cartography-k8s-lambda-role` has a fixed name and
+- **Lambda role:** `cartography-k8s-lambda-role-<region>` has a fixed name and
   `DeletionPolicy: Retain`. The reader trust names it by ARN, and IAM pins
   that to the role's unique ID, so deleting and recreating it silently breaks
   trust until the reader roles are updated.
@@ -47,7 +47,7 @@ cluster failed, so failures can't hide behind a green execution.
 Each synced cluster needs, in its own account:
 
 1. **A reader role** (`cartography-k8s-reader`, or set `ReaderRoleName`) that
-   trusts `cartography-k8s-lambda-role` (the `LambdaRoleArn` stack output), or
+   trusts `cartography-k8s-lambda-role-<region>` (the `LambdaRoleArn` stack output), or
    the intermediate role if you use one. IAM permissions:
    - `eks:DescribeCluster`
    - `eks:ListAccessEntries` and `eks:ListIdentityProviderConfigs` (without
@@ -124,18 +124,18 @@ RETURN a.name, a.id, c.name, c.region ORDER BY a.name
 By default the Lambda assumes the reader role directly:
 
 ```
-cartography-k8s-lambda-role → <account>/cartography-k8s-reader
+cartography-k8s-lambda-role-<region> → <account>/cartography-k8s-reader
 ```
 
 If the reader roles already trust some other role in this account and you
 can't change them yet, set `IntermediateRoleName` to that role:
 
 ```
-cartography-k8s-lambda-role → <IntermediateRoleName> → <account>/cartography-k8s-reader
+cartography-k8s-lambda-role-<region> → <IntermediateRoleName> → <account>/cartography-k8s-reader
 ```
 
 - The stack grants the Lambda role `sts:AssumeRole` on the intermediate role.
-  The intermediate role's trust policy must allow `cartography-k8s-lambda-role`.
+  The intermediate role's trust policy must allow `cartography-k8s-lambda-role-<region>`.
   Using the account root as principal with an `aws:PrincipalArn` condition
   works before the Lambda role exists and survives it being recreated.
 - STS caps chained sessions at 1h. The reader session is 900s.

@@ -15,7 +15,7 @@ org (or one project batch of a large org).
 ## Auth
 
 No keys or secrets. Workload Identity Federation: the Lambda's role
-(`cartography-gcp-lambda-loader-role`, name is load-bearing, see
+(`cartography-gcp-lambda-loader-role-<region>`, name is load-bearing, see
 `../gcp/main.tf`) signs an AWS STS GetCallerIdentity request, GCP STS exchanges
 it, and the Lambda impersonates `GcpServiceAccount`
 (`cartography-reader@<project>.iam.gserviceaccount.com`).

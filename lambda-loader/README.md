@@ -307,7 +307,7 @@ compiled dependencies such as `cryptography` are platform-specific.
 - Connects to `bolt://<neo4j-private-ip>:8443` (SSM
   `/cartography/neo4j/private-ip`) as user `neo4j`, with the password read
   from SSM `/cartography/neo4j/password` at invocation time.
-- Execution role `cartography-lambda-loader-role`: `SecurityAudit` (for the
+- Execution role `cartography-lambda-loader-role-<region>`: `SecurityAudit` (for the
   hub account), `sts:AssumeRole` on `cartography-read-only` in spoke accounts
   (`../stackset/`), `ec2:DescribeRegions`, `organizations:DescribeAccount`,
   `lambda:GetFunction`, `codebuild:BatchGetBuilds`, `ssm:GetParameter` on

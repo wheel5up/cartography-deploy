@@ -113,13 +113,13 @@ Resources:
 
   # ── Lambda ─────────────────────────────────────────────────────────────
   # The role NAME is load-bearing: ../gcp/main.tf's WIF provider only accepts
-  # arn:aws:sts::<acct>:assumed-role/cartography-gcp-lambda-loader-role/*.
+  # arn:aws:sts::<acct>:assumed-role/cartography-gcp-lambda-loader-role-<region>/*.
   # Beyond VPC ENIs it only reads the Neo4j password; the STS
   # GetCallerIdentity request google-auth signs requires no IAM permission.
   LambdaExecutionRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: cartography-gcp-lambda-loader-role
+      RoleName: !Sub "cartography-gcp-lambda-loader-role-${AWS::Region}"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -177,7 +177,7 @@ Resources:
   StateMachineRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: cartography-gcp-lambda-statemachine-role
+      RoleName: !Sub "cartography-gcp-lambda-statemachine-role-${AWS::Region}"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -311,7 +311,7 @@ Resources:
   OrchestratorRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: cartography-gcp-lambda-orchestrator-role
+      RoleName: !Sub "cartography-gcp-lambda-orchestrator-role-${AWS::Region}"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -610,7 +610,7 @@ Resources:
   SchedulerRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: cartography-gcp-lambda-scheduler-role
+      RoleName: !Sub "cartography-gcp-lambda-scheduler-role-${AWS::Region}"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:

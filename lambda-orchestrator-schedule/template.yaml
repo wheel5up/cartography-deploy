@@ -46,7 +46,7 @@ Resources:
   ControllerStateMachineRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: cartography-lambda-daily-controller-role
+      RoleName: !Sub "cartography-lambda-daily-controller-role-${AWS::Region}"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -97,7 +97,7 @@ Resources:
   SchedulerRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: cartography-lambda-daily-scheduler-role
+      RoleName: !Sub "cartography-lambda-daily-scheduler-role-${AWS::Region}"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:

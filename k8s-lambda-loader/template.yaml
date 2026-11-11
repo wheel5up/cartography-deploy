@@ -26,7 +26,8 @@ Parameters:
     Description: >
       Per-account role bound to the cluster's
       cartography-readonly group via an EKS Access Entry. Its trust policy
-      must list cartography-k8s-lambda-role, or (interim) IntermediateRoleName.
+      must list cartography-k8s-lambda-role-<region>, or (interim)
+      IntermediateRoleName.
 
   IntermediateRoleName:
     Type: String
@@ -34,8 +35,8 @@ Parameters:
     Description: >
       Optional. Same-account role the Lambda assumes first, then assumes the
       reader from. Use it when cartography-k8s-reader trusts some other role
-      instead of cartography-k8s-lambda-role; that role's trust policy must
-      allow cartography-k8s-lambda-role. Leave "" for the direct path.
+      instead of cartography-k8s-lambda-role-<region>; that role's trust
+      policy must allow it. Leave "" for the direct path.
 
   VpcId:
     Type: AWS::EC2::VPC::Id
@@ -148,7 +149,7 @@ Resources:
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Properties:
-      RoleName: cartography-k8s-lambda-role
+      RoleName: !Sub "cartography-k8s-lambda-role-${AWS::Region}"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -239,7 +240,7 @@ Resources:
   StateMachineRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: cartography-k8s-lambda-statemachine-role
+      RoleName: !Sub "cartography-k8s-lambda-statemachine-role-${AWS::Region}"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -414,7 +415,7 @@ Resources:
   SchedulerRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: cartography-k8s-lambda-scheduler-role
+      RoleName: !Sub "cartography-k8s-lambda-scheduler-role-${AWS::Region}"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:

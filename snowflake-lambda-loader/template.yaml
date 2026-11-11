@@ -141,7 +141,7 @@ Resources:
   LambdaExecutionRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: cartography-snowflake-lambda-loader-role
+      RoleName: !Sub "cartography-snowflake-lambda-loader-role-${AWS::Region}"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -217,7 +217,7 @@ Resources:
   StateMachineRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: cartography-snowflake-lambda-statemachine-role
+      RoleName: !Sub "cartography-snowflake-lambda-statemachine-role-${AWS::Region}"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -431,7 +431,7 @@ Resources:
   CartographySnowflakeLambdaOrchestratorRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: cartography-snowflake-lambda-orchestrator-role
+      RoleName: !Sub "cartography-snowflake-lambda-orchestrator-role-${AWS::Region}"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -766,7 +766,7 @@ Resources:
   SnowflakeLambdaSchedulerRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: cartography-snowflake-lambda-scheduler-role
+      RoleName: !Sub "cartography-snowflake-lambda-scheduler-role-${AWS::Region}"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
