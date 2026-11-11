@@ -1,0 +1,769 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Cartography - GitHub Lambda Loader (per-repository design). One Lambda, three
+  state machines: -sync (one Lambda invocation per execution), -org-orchestrator
+  (one org: org_core -> Distributed Map of repo steps -> org_finalize), and
+  -orchestrator (scheduled: every org in parallel, then the global cleanup).
+  See src/handler.py module docstring.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC that Neo4j and the loaders run in.
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Private subnet with outbound internet (NAT), same VPC as Neo4j.
+  LambdaMemoryMb:
+    Type: Number
+    Default: 1024
+  ScheduleDefault:
+    Type: String
+    Default: "cron(0 4 * * ? *)"
+    Description: >
+      Seed for /cartography/github-lambda/schedule. Default 04:00 UTC.
+  OrgsJson:
+    Type: String
+    Description: >
+      Seed for /cartography/github-lambda/orgs: JSON object of org login ->
+      SSM parameter holding that org's GitHub App installation id, e.g.
+      {"my-org": "/cartography/github/app/installation-id"}.
+  RepoSplitsJson:
+    Type: String
+    Default: "{}"
+    Description: >
+      Seed for /cartography/github-lambda/repo-splits: JSON object of
+      org -> repo -> parts, for repos too big for one invocation (see
+      src/handler.py). Empty means every repo runs as one invocation.
+
+Resources:
+
+  # ── Networking ─────────────────────────────────────────────────────────
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: cartography-github-lambda-loader-sg
+      GroupDescription: Cartography GitHub Lambda loader - outbound only
+      VpcId: !Ref VpcId
+      Tags:
+        - { Key: Name, Value: cartography-github-lambda-loader-sg }
+        - { Key: Project, Value: cartography }
+
+  LambdaEgressHttps:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref LambdaSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: 0.0.0.0/0
+      Description: Outbound HTTPS (GitHub API, SSM)
+
+  LambdaEgressNeo4jBolt:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref LambdaSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8443
+      ToPort: 8443
+      DestinationSecurityGroupId: "{{resolve:ssm:/cartography/sg/neo4j}}"
+      Description: Bolt 8443 to Neo4j
+
+  Neo4jIngressFromGitHubLambda:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: "{{resolve:ssm:/cartography/sg/neo4j}}"
+      IpProtocol: tcp
+      FromPort: 8443
+      ToPort: 8443
+      SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      Description: Bolt 8443 from Cartography GitHub Lambda loader
+
+  # ── Lambda ─────────────────────────────────────────────────────────────
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cartography-github-lambda-loader-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: ReadNeo4jPassword
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cartography/neo4j/password"
+        - PolicyName: ReadGitHubParams
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource:
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cartography/github/app/*"
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cartography/github/commit-lookback-days"
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cartography/github-lambda/repo-splits"
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cartography/github-lambda/ghcr-splits"
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cartography/github-lambda/orgs"
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cartography/github/domains-pat"
+      Tags:
+        - { Key: Project, Value: cartography }
+
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /cartography/github-lambda-loader
+      RetentionInDays: 30
+
+  GitHubLoaderFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: cartography-github-lambda-loader
+      Handler: handler.handler
+      Runtime: python3.13
+      Architectures: [x86_64]
+      CodeUri: .
+      MemorySize: !Ref LambdaMemoryMb
+      Timeout: 900
+      Role: !GetAtt LambdaExecutionRole.Arn
+      VpcConfig:
+        SecurityGroupIds: [!Ref LambdaSecurityGroup]
+        SubnetIds: [!Ref SubnetId]
+      LoggingConfig:
+        LogGroup: !Ref LambdaLogGroup
+      Environment:
+        Variables:
+          NEO4J_URI: "bolt://{{resolve:ssm:/cartography/neo4j/private-ip}}:8443"
+          NEO4J_PASSWORD_SSM_PARAM: /cartography/neo4j/password
+          NEO4J_MAX_CONNECTION_LIFETIME: "200"
+      Tags:
+        Project: cartography
+
+  # ── Step Functions ─────────────────────────────────────────────────────
+  # Three state machines (same sync/orchestrator convention as Okta/Snowflake,
+  # plus a per-org level so orgs run in parallel):
+  #
+  #   cartography-github-lambda-sync              one Lambda invocation per execution
+  #   cartography-github-lambda-org-orchestrator  one org: org_core -> repo Map -> org_finalize
+  #   cartography-github-lambda-orchestrator      scheduled: every org in parallel -> unscoped_cleanup
+  #
+  # Nothing per-repo is returned through Step Functions: each repo writes its
+  # cleanup-safety flags to Neo4j; org_finalize reads them back. The repo Map
+  # only collects failures. See src/handler.py.
+
+  StateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /cartography/scheduler/github-lambda
+      RetentionInDays: 30
+
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cartography-github-lambda-statemachine-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: states.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeLoaderLambda
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt GitHubLoaderFunction.Arn
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: "*"
+      Tags:
+        - { Key: Project, Value: cartography }
+
+  # Orchestrators: start + wait on child executions (.sync:2), run a
+  # Distributed Map (child executions), read the org list.
+  OrchestratorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cartography-github-lambda-orchestrator-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: states.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: RunChildExecutions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource:
+                  - !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:cartography-github-lambda-sync"
+                  - !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:cartography-github-lambda-org-orchestrator"
+              - Effect: Allow
+                Action: [states:DescribeExecution, states:StopExecution]
+                Resource:
+                  - !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:cartography-github-lambda-sync:*"
+                  - !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:cartography-github-lambda-org-orchestrator:*"
+              - Effect: Allow
+                Action: [events:PutTargets, events:PutRule, events:DescribeRule]
+                Resource: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsForStepFunctionsExecutionRule"
+              # Distributed Map: the org-orchestrator starts and manages its own Map Run.
+              - Effect: Allow
+                Action: [states:DescribeMapRun, states:UpdateMapRun, states:ListMapRuns]
+                Resource:
+                  - !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:mapRun:cartography-github-lambda-org-orchestrator/*"
+                  - !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:cartography-github-lambda-org-orchestrator"
+        - PolicyName: ReadOrgList
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cartography/github-lambda/orgs"
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: "*"
+      Tags:
+        - { Key: Project, Value: cartography }
+
+  # ── 1. sync: exactly one Lambda invocation ─────────────────────────────
+  # Input: the Lambda event ({"step", "org", "repo", "part", "update_tag", ...}).
+  # Output: the handler's result. FAILED -> Fail state (red execution, error
+  # and cause from the handler) so every parent sees a real error.
+  GitHubSyncStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: cartography-github-lambda-sync
+      RoleArn: !GetAtt StateMachineRole.Arn
+      LoggingConfiguration:
+        Level: ERROR
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup: { LogGroupArn: !GetAtt StateMachineLogGroup.Arn }
+      DefinitionSubstitutions:
+        Fn: !GetAtt GitHubLoaderFunction.Arn
+      Definition:
+        QueryLanguage: JSONata
+        StartAt: Init
+        States:
+          Init:
+            Type: Pass
+            Assign:
+              event: "{% $states.input %}"
+              rateLimitWaits: 0
+            Next: Invoke
+          Invoke:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Arguments:
+              FunctionName: "${Fn}"
+              Payload: "{% $event %}"
+            Retry:
+              - ErrorEquals: [Lambda.ServiceException, Lambda.AWSLambdaException, Lambda.SdkClientException, Lambda.TooManyRequestsException]
+                IntervalSeconds: 2
+                MaxAttempts: 2
+                BackoffRate: 2
+            Output: "{% $states.result.Payload %}"
+            Next: Succeeded?
+          Succeeded?:
+            Type: Choice
+            Choices:
+              - Condition: "{% $states.input.status = 'SUCCEEDED' %}"
+                Next: Done
+              # GitHub rate limit outlasts this invocation (src/handler.py,
+              # "Rate-limit guard"): wait until GitHub's reset, then re-invoke
+              # the same event. Capped so a bad resumeAt can't loop forever;
+              # past the cap it fails like any other step.
+              - Condition: "{% $states.input.status = 'RATE_LIMITED' and $rateLimitWaits < 3 %}"
+                Next: WaitForRateLimitReset
+            Default: StepFailed
+          WaitForRateLimitReset:
+            Type: Wait
+            # A timestamp already in the past continues immediately.
+            Timestamp: "{% $states.input.resumeAt %}"
+            Assign:
+              rateLimitWaits: "{% $rateLimitWaits + 1 %}"
+            Next: Invoke
+          Done:
+            Type: Succeed
+          StepFailed:
+            Type: Fail
+            Error: "{% 'GitHubStepFailed.' & $states.input.step %}"
+            Cause: "{% $string($states.input) %}"
+
+  # ── 2. org-orchestrator: one org ───────────────────────────────────────
+  # Input:
+  #   {"org", "update_tag"}                      full org: org_core -> repos -> org_finalize
+  #   {"org", "update_tag"?, "repos": [...]}     targeted: those repos only, NO cleanup
+  #   {"org", "update_tag"?, "core_only": true}  org_core only, NO cleanup
+  #   {"org", "update_tag"?, "ghcr_only": true}  every ghcr part, serial, one tag;
+  #                                              GHCR cleanup on the last part only
+  #                                              (guarded), nothing else
+  # update_tag defaults to now (standalone runs); the top-level orchestrator
+  # always passes its shared tag.
+  GitHubOrgOrchestrator:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: cartography-github-lambda-org-orchestrator
+      RoleArn: !GetAtt OrchestratorRole.Arn
+      LoggingConfiguration:
+        Level: ERROR
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup: { LogGroupArn: !GetAtt StateMachineLogGroup.Arn }
+      DefinitionSubstitutions:
+        Sync: !Ref GitHubSyncStateMachine
+      Definition:
+        QueryLanguage: JSONata
+        StartAt: Init
+        States:
+
+          Init:
+            Type: Pass
+            Assign:
+              org: "{% $states.input.org %}"
+              tag: "{% $exists($states.input.update_tag) ? $states.input.update_tag : $floor($millis() / 1000) %}"
+              targetRepos: "{% $exists($states.input.repos) ? $states.input.repos : [] %}"
+              coreOnly: "{% $exists($states.input.core_only) and $states.input.core_only = true %}"
+              ghcrOnly: "{% $exists($states.input.ghcr_only) and $states.input.ghcr_only = true %}"
+              orgSafe: {}
+              # Execution-name-safe prefix for child executions (max 80 chars).
+              prefix: "{% 'gh-' & $string($exists($states.input.update_tag) ? $states.input.update_tag : $floor($millis() / 1000)) & '-' & $substring($states.input.org, 0, 30) %}"
+            Next: Mode
+
+          Mode:
+            Type: Choice
+            Choices:
+              - Condition: "{% $count($targetRepos) > 0 %}"
+                Next: ExpandTargets
+              # GHCR repair/ad hoc: skip org_core, run GhcrExpand -> GhcrParts,
+              # then stop (AfterGhcr?). Same serial Map as the full run.
+              - Condition: "{% $ghcrOnly %}"
+                Next: GhcrExpand
+            Default: OrgCore
+
+          # ── targeted ──
+          ExpandTargets:
+            Type: Task
+            Resource: arn:aws:states:::states:startExecution.sync:2
+            Arguments:
+              StateMachineArn: "${Sync}"
+              Name: "{% $prefix & '-expand-' & $string($millis()) %}"
+              Input: { step: expand_targets, org: "{% $org %}", repos: "{% $targetRepos %}" }
+            Assign:
+              items: "{% $states.result.Output.items %}"
+              cleanup: false
+            Output: {}
+            Next: Repos
+
+          # ── full / core-only ──
+          OrgCore:
+            Type: Task
+            Resource: arn:aws:states:::states:startExecution.sync:2
+            Arguments:
+              StateMachineArn: "${Sync}"
+              Name: "{% $prefix & '-core' %}"
+              Input: { step: org_core, org: "{% $org %}", update_tag: "{% $tag %}" }
+            Assign:
+              items: "{% $states.result.Output.items %}"
+              orgSafe: "{% $states.result.Output.orgSafe %}"
+              reposComplete: "{% $states.result.Output.reposComplete %}"
+              cleanup: true
+            Output: {}
+            Next: CoreOnly?
+
+          # core_only means org-level data ONLY (users, teams, org settings,
+          # repo metadata) — no repos, and (since GHCR package-batching can run
+          # 7+ serial ~7min invocations, see GhcrParts) no GHCR either. Full
+          # runs go through GhcrExpand/GhcrParts before Repos.
+          CoreOnly?:
+            Type: Choice
+            Choices:
+              - Condition: "{% $coreOnly %}"
+                Next: CoreOnlyDone
+            Default: GhcrExpand
+
+          CoreOnlyDone:
+            Type: Pass
+            Output: { step: org_core_only, org: "{% $org %}", status: SUCCEEDED, updateTag: "{% $tag %}" }
+            End: true
+
+          # How many ghcr parts this org needs (GITHUB_GHCR_SPLITS_PARAM; 1 if
+          # unsplit). SSM-only, no GitHub/Neo4j calls — cheap, always run.
+          GhcrExpand:
+            Type: Task
+            Resource: arn:aws:states:::states:startExecution.sync:2
+            Arguments:
+              StateMachineArn: "${Sync}"
+              Name: "{% $prefix & '-ghcr-expand' %}"
+              Input: { step: ghcr_expand, org: "{% $org %}" }
+            Assign:
+              ghcrParts: "{% $states.result.Output.parts %}"
+            Output: {}
+            Next: GhcrParts
+
+          # One child sync execution per ghcr part, SERIAL (parts after the
+          # first must see an already-loaded graph from earlier parts of the
+          # SAME tag: layer/package cross-run dedup and manifest-list child
+          # lookups read Neo4j). get_container_images() logs nothing
+          # per-package until entirely done, so for an org with hundreds of
+          # packages a single invocation can exceed 900s even alone
+          # (Sandbox.Timedout, BOTH folded into org_core AND isolated). GITHUB_GHCR_SPLITS_PARAM ranges packages [lo, hi);
+          # real cleanup only runs on the part whose range ends at null
+          # (src/handler.py's _ghcr()) — earlier parts load-only, so a failure
+          # here before every part completes must not reach org_finalize.
+          # PAT-only; every part no-ops cleanly if no domains PAT is configured.
+          GhcrParts:
+            Type: Map
+            Items: "{% [0..($ghcrParts - 1)] %}"
+            MaxConcurrency: 1
+            ItemSelector:
+              part: "{% $states.context.Map.Item.Value %}"
+              org: "{% $org %}"
+              tag: "{% $tag %}"
+              prefix: "{% $prefix %}"
+            ItemProcessor:
+              ProcessorConfig: { Mode: INLINE }
+              StartAt: GhcrPart
+              States:
+                GhcrPart:
+                  Type: Task
+                  Resource: arn:aws:states:::states:startExecution.sync:2
+                  Arguments:
+                    StateMachineArn: "${Sync}"
+                    Name: >-
+                      {% $substring($states.input.prefix & '-ghcr-p'
+                         & $string($states.input.part), 0, 80) %}
+                    Input:
+                      step: ghcr
+                      org: "{% $states.input.org %}"
+                      part: "{% $states.input.part %}"
+                      update_tag: "{% $states.input.tag %}"
+                  Output: "{% $states.result.Output %}"
+                  End: true
+            Assign:
+              # Last part's orgSafe.ghcr wins (earlier parts are load-only and
+              # report ghcr:true once their own slice succeeds; only the
+              # final part's result reflects whether cleanup actually ran).
+              orgSafe: "{% $merge([$orgSafe, $states.result[-1].orgSafe]) %}"
+            Output: {}
+            Next: AfterGhcr?
+
+          AfterGhcr?:
+            Type: Choice
+            Choices:
+              - Condition: "{% $ghcrOnly %}"
+                Next: GhcrOnlyDone
+            Default: Repos
+
+          GhcrOnlyDone:
+            Type: Pass
+            Output: { step: org_ghcr_only, org: "{% $org %}", status: SUCCEEDED, updateTag: "{% $tag %}", parts: "{% $ghcrParts %}", orgSafe: "{% $orgSafe %}" }
+            End: true
+
+          # One child sync execution per {repo, part}. Serial per org (one App
+          # token per org). Each item catches its own failure so every repo
+          # still runs; failures are collected and gate org_finalize.
+          # Item results are {} or {"failed": "repo:part"} only, so the Map
+          # result stays small however many repos there are.
+          Repos:
+            Type: Map
+            Items: "{% $items %}"
+            MaxConcurrency: 1
+            ItemSelector:
+              repo: "{% $states.context.Map.Item.Value.repo %}"
+              part: "{% $states.context.Map.Item.Value.part %}"
+              org: "{% $org %}"
+              tag: "{% $tag %}"
+              prefix: "{% $prefix %}"
+            ItemProcessor:
+              ProcessorConfig: { Mode: DISTRIBUTED, ExecutionType: STANDARD }
+              StartAt: Repo
+              States:
+                Repo:
+                  Type: Task
+                  Resource: arn:aws:states:::states:startExecution.sync:2
+                  Arguments:
+                    StateMachineArn: "${Sync}"
+                    # Execution names: [A-Za-z0-9-_], max 80 chars, unique per
+                    # attempt (a retry is a NEW child execution): first attempt
+                    # ...-p<part>, retry ...-p<part>-r1. The suffix is appended
+                    # after truncation so it is never cut off.
+                    Name: >-
+                      {% $substring($states.input.prefix & '-'
+                         & $replace($states.input.repo, /[^A-Za-z0-9_-]/, '_')
+                         & '-p' & $string($states.input.part), 0, 76)
+                         & ($states.context.State.RetryCount > 0
+                            ? '-r' & $string($states.context.State.RetryCount) : '') %}
+                    Input:
+                      step: repo
+                      org: "{% $states.input.org %}"
+                      repo: "{% $states.input.repo %}"
+                      part: "{% $states.input.part %}"
+                      update_tag: "{% $states.input.tag %}"
+                  Retry:
+                    - ErrorEquals: [StepFunctions.ExecutionLimitExceeded, StepFunctions.ServiceException]
+                      IntervalSeconds: 2
+                      MaxAttempts: 3
+                      BackoffRate: 2
+                    # The child -sync execution ended FAILED (handler error,
+                    # Lambda timeout/crash): run this repo once more as a new
+                    # execution. Repo steps only MERGE under the same tag and
+                    # never delete, so a re-run is safe.
+                    - ErrorEquals: [States.TaskFailed]
+                      IntervalSeconds: 30
+                      MaxAttempts: 1
+                  Catch:
+                    - ErrorEquals: ["States.ALL"]
+                      Output: { failed: "{% $states.input.repo & ':' & $string($states.input.part) %}" }
+                      Next: RepoDone
+                  Output: {}
+                  Next: RepoDone
+                RepoDone:
+                  Type: Pass
+                  End: true
+            Assign:
+              failed: "{% $append([], $states.result[$exists(failed)].failed) %}"
+            Output: {}
+            Next: AnyFailed?
+
+          AnyFailed?:
+            Type: Choice
+            Choices:
+              - Condition: "{% $count($failed) > 0 %}"
+                Next: ReposFailed
+              - Condition: "{% $not($cleanup) %}"
+                Next: TargetedDone
+            Default: OrgFinalize
+
+          ReposFailed:
+            Type: Fail
+            Error: GitHubReposFailed
+            Cause: "{% $string({'org': $org, 'updateTag': $tag, 'failedCount': $count($failed), 'failed': $failed}) %}"
+
+          TargetedDone:
+            Type: Pass
+            Output: { step: targeted, org: "{% $org %}", status: SUCCEEDED, updateTag: "{% $tag %}", items: "{% $count($items) %}" }
+            End: true
+
+          OrgFinalize:
+            Type: Task
+            Resource: arn:aws:states:::states:startExecution.sync:2
+            Arguments:
+              StateMachineArn: "${Sync}"
+              Name: "{% $prefix & '-finalize' %}"
+              Input:
+                step: org_finalize
+                org: "{% $org %}"
+                update_tag: "{% $tag %}"
+                items: "{% $items %}"
+                failed: "{% $failed %}"
+                org_safe: "{% $orgSafe %}"
+                repos_complete: "{% $reposComplete %}"
+            Output: "{% $states.result.Output %}"
+            End: true
+
+  # ── 3. orchestrator: every org, then global cleanup ────────────────────
+  # Input: {} (scheduled). One shared update_tag across all orgs, required by
+  # the global cleanup.
+  GitHubOrchestrator:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: cartography-github-lambda-orchestrator
+      RoleArn: !GetAtt OrchestratorRole.Arn
+      LoggingConfiguration:
+        Level: ERROR
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup: { LogGroupArn: !GetAtt StateMachineLogGroup.Arn }
+      DefinitionSubstitutions:
+        Sync: !Ref GitHubSyncStateMachine
+        OrgOrchestrator: !Ref GitHubOrgOrchestrator
+      Definition:
+        QueryLanguage: JSONata
+        StartAt: GetOrgs
+        States:
+
+          GetOrgs:
+            Type: Task
+            Resource: arn:aws:states:::aws-sdk:ssm:getParameter
+            Arguments:
+              Name: /cartography/github-lambda/orgs
+            Assign:
+              tag: "{% $floor($millis() / 1000) %}"
+              orgs: "{% $append([], $keys($parse($states.result.Parameter.Value))) %}"
+            Output: {}
+            Next: Orgs
+
+          # Orgs in parallel (separate App installations, separate rate limits).
+          # Any org failing fails this Map and the execution: global cleanup
+          # never runs after a partial run.
+          Orgs:
+            Type: Map
+            Items: "{% $orgs %}"
+            MaxConcurrency: 0
+            ItemProcessor:
+              ProcessorConfig: { Mode: INLINE }
+              StartAt: Org
+              States:
+                Org:
+                  Type: Task
+                  Resource: arn:aws:states:::states:startExecution.sync:2
+                  Arguments:
+                    StateMachineArn: "${OrgOrchestrator}"
+                    Name: "{% 'gh-' & $string($tag) & '-' & $substring($states.input, 0, 60) %}"
+                    Input: { org: "{% $states.input %}", update_tag: "{% $tag %}" }
+                  Output: "{% $states.result.Output %}"
+                  End: true
+            Assign:
+              orgResults: "{% $append([], $states.result) %}"
+            Output: {}
+            Next: AllOrgsFinalized?
+
+          # Every configured org must have a SUCCEEDED org_finalize under this
+          # run's tag. The Lambda re-checks the same thing before deleting.
+          AllOrgsFinalized?:
+            Type: Choice
+            Choices:
+              - Condition: >-
+                  {% $count($orgResults[step = 'org_finalize' and status = 'SUCCEEDED' and updateTag = $tag]) = $count($orgs) %}
+                Next: UnscopedCleanup
+            Default: NotAllFinalized
+
+          NotAllFinalized:
+            Type: Fail
+            Error: GitHubNotAllOrgsFinalized
+            Cause: "{% $string({'updateTag': $tag, 'orgs': $orgs, 'results': $orgResults}) %}"
+
+          UnscopedCleanup:
+            Type: Task
+            Resource: arn:aws:states:::states:startExecution.sync:2
+            Arguments:
+              StateMachineArn: "${Sync}"
+              Name: "{% 'gh-' & $string($tag) & '-unscoped-cleanup' %}"
+              Input:
+                step: unscoped_cleanup
+                update_tag: "{% $tag %}"
+                org_results: "{% $orgResults %}"
+            Output:
+              updateTag: "{% $tag %}"
+              orgs: "{% $orgResults %}"
+              cleanup: "{% $states.result.Output %}"
+            End: true
+
+  # ── Configured orgs ────────────────────────────────────────────────────
+  # org login -> SSM parameter holding that org's App installation id.
+  # CloudFormation seeds this on create only; edit with put-parameter --overwrite.
+  OrgsParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /cartography/github-lambda/orgs
+      Type: String
+      Value: !Ref OrgsJson
+      Tags: { Project: cartography }
+
+  # ── Repo splits (exceptions only; see src/handler.py) ───────────────────
+  # CloudFormation seeds this on create only; edit live with
+  # `aws ssm put-parameter --overwrite` (no redeploy). Repos not listed run
+  # as a single invocation.
+  RepoSplitsParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /cartography/github-lambda/repo-splits
+      Type: String
+      Tier: Advanced
+      Value: !Ref RepoSplitsJson
+      Tags: { Project: cartography }
+
+  # ── Schedule (created DISABLED until EC2-vs-Lambda comparison passes) ──
+  ScheduleParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /cartography/github-lambda/schedule
+      Type: String
+      Value: !Ref ScheduleDefault
+      Tags: { Project: cartography }
+
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cartography-github-lambda-scheduler-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: scheduler.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StartStateMachine
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref GitHubOrchestrator
+      Tags:
+        - { Key: Project, Value: cartography }
+
+  # Change State here, not via the CLI (a CLI flip is reverted by sam deploy).
+  GitHubLambdaSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: cartography-github-lambda-daily
+      State: ENABLED
+      ScheduleExpression: !Sub "{{resolve:ssm:${ScheduleParameter}}}"
+      ScheduleExpressionTimezone: UTC
+      FlexibleTimeWindow: { Mode: "OFF" }
+      Target:
+        Arn: !Ref GitHubOrchestrator
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: "{}"
+
+Outputs:
+  OrchestratorArn:
+    Value: !Ref GitHubOrchestrator
+  OrgOrchestratorArn:
+    Value: !Ref GitHubOrgOrchestrator
+  SyncStateMachineArn:
+    Value: !Ref GitHubSyncStateMachine
+  FunctionArn:
+    Value: !GetAtt GitHubLoaderFunction.Arn
+  LambdaLogGroup:
+    Value: !Ref LambdaLogGroup

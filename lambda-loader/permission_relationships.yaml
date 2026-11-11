@@ -1,0 +1,161 @@
+# AWS permission relationships (RPR) mapping for cartography-lambda-loader.
+#
+# Read by cartography.intel.aws.permission_relationships.sync() via
+# common_job_parameters["permission_relationships_file"] (see handler.py
+# PERMISSION_RELATIONSHIPS_FILE). Packaged into the Lambda by the Makefile.
+# The vendored fork's cartography/data/permission_relationships.yaml is NOT
+# used. Docs: https://docs.cartography.dev/modules/aws/permissions-mapping.html
+#
+# This is the COMPLETE mapping, not a delta. The module reads exactly one
+# file, so anything not listed here is not mapped.
+#
+# Layout:
+#   1. UPSTREAM section: verbatim copy of the fork's
+#      cartography/data/permission_relationships.yaml at the Makefile's
+#      CARTOGRAPHY_GIT_REF. Do not edit it here.
+#   2. ADDITIONS section: entries added by this repo.
+#
+# On every CARTOGRAPHY_GIT_REF bump in the Makefile: re-copy the upstream
+# file into section 1. tests/test_permission_relationships.py fails if any
+# upstream entry at the vendored ref is missing from this file.
+#
+# Engine limits, which bound what an entry can express:
+#   - Only the principal's own identity policies are evaluated (POLICY ->
+#     STATEMENT). Not evaluated: SCPs, permission boundaries, resource
+#     policies (S3 bucket policies, KMS key policies), session policies.
+#   - Allow/Deny/NotAction/NotResource are handled. Conditions are annotated
+#     on the edge (has_condition, condition_keys, conditions), not evaluated.
+#   - An entry means "ANY of these permissions on ONE target label". "A and B"
+#     or cross-resource checks have to be joined in Cypher afterwards.
+#   - Targets are (:AWSAccount {id})-[:RESOURCE]->(:<target_label>) nodes,
+#     matched on .arn. Edges are cleaned up per account.
+
+# ===========================================================================
+# 1. UPSTREAM - verbatim, do not edit
+# ===========================================================================
+# Map principals that can read items from an AWSS3Bucket. Specifically,
+# create an (:AWSPrincipal)-[:CAN_READ]->(:AWSS3Bucket) relationship
+# for principals that have a policy attached with _any_ of the below
+# permissions. Similar logic applies for the other entries in this file.
+- target_label: AWSS3Bucket
+  permissions:
+  - S3:GetObject
+  relationship_name: CAN_READ
+# Map principals that can write items to an AWSS3Bucket.
+- target_label: AWSS3Bucket
+  permissions:
+  - S3:PutObject
+  relationship_name: CAN_WRITE
+# Map principals that can retrieve data from DynamoDB.
+- target_label: AWSDynamoDBTable
+  permissions:
+  - dynamodb:BatchGetItem
+  - dynamodb:GetItem
+  - dynamodb:GetRecords
+  - dynamodb:Query
+  - dynamodb:Scan
+  relationship_name: CAN_QUERY
+# Map principals that can write data to DynamoDB.
+- target_label: AWSDynamoDBTable
+  permissions:
+  - dynamodb:PutItem
+  - dynamodb:UpdateItem
+  - dynamodb:DeleteItem
+  - dynamodb:BatchWriteItem
+  relationship_name: CAN_WRITE
+# Map principals that can retrieve secrets from Secrets Manager.
+- target_label: AWSSecretsManagerSecret
+  permissions:
+  - secretsmanager:GetSecretValue
+  relationship_name: GET_SECRET
+# Map principals that can administer RedshiftClusters.
+- target_label: AWSRedshiftCluster
+  permissions:
+  - redshift:*
+  - redshift:CreateClusterUser
+  - redshift:GetClusterCredentials
+  - redshift:JoinGroup
+  relationship_name: CAN_ADMINISTER
+# Map principals that can query RDS instances via IAM database authentication.
+- target_label: AWSRDSInstance
+  permissions:
+  - rds-db:connect
+  relationship_name: CAN_QUERY
+# Map principals that can administer RDS instances.
+- target_label: AWSRDSInstance
+  permissions:
+  - rds:*
+  - rds:ModifyDBInstance
+  - rds:DeleteDBInstance
+  - rds:RebootDBInstance
+  - rds:StopDBInstance
+  - rds:StartDBInstance
+  relationship_name: CAN_ADMINISTER
+# Map principals that can execute commands in ECS tasks.
+- target_label: AWSECSTask
+  permissions:
+  - ecs:ExecuteCommand
+  relationship_name: CAN_EXECUTE_COMMAND
+# Map principals that can pass an IAM role to an AWS service.
+# iam:PassRole is required to attach an instance profile to ec2:RunInstances,
+# an execution role to lambda:CreateFunction, ecs:RunTask, etc. Combined with
+# a service-launch permission this is a privilege-escalation primitive.
+- target_label: AWSRole
+  permissions:
+  - iam:PassRole
+  relationship_name: CAN_PASS_ROLE
+# Map principals that can execute CloudFormation stacks.
+- target_label: AWSCloudFormationStack
+  permissions:
+  - cloudformation:UpdateStack
+  relationship_name: CAN_EXEC
+# Map principals that can open an SSM Session Manager shell on an EC2 instance.
+# Two conditions must both hold (see issue #1643):
+#   1. the principal has ssm:StartSession on the instance, and
+#   2. the instance is actually managed by SSM, i.e. it has an
+#      (:AWSEC2Instance)-[:HAS_INFORMATION]->(:AWSSSMInstanceInformation) edge.
+# The target_precondition enforces (2) so we don't draw CAN_START_SESSION edges
+# to instances the SSM agent never registered (where StartSession would fail).
+- target_label: AWSEC2Instance
+  permissions:
+  - ssm:StartSession
+  relationship_name: CAN_START_SESSION
+  target_precondition:
+    related_label: AWSSSMInstanceInformation
+    relationship: HAS_INFORMATION
+    direction: outgoing
+
+# ===========================================================================
+# 2. ADDITIONS
+# ===========================================================================
+# Map principals that can read SSM parameter values. All four return the
+# value: GetParameters/GetParametersByPath are batch reads, and
+# GetParameterHistory returns past values, including SecureString values when
+# decrypted. For SecureString parameters, reading the plaintext also needs
+# kms:Decrypt on the parameter's key; see CAN_DECRYPT below. ssm:Describe* is
+# metadata only and deliberately not listed.
+- target_label: AWSSSMParameter
+  permissions:
+  - ssm:GetParameter
+  - ssm:GetParameters
+  - ssm:GetParametersByPath
+  - ssm:GetParameterHistory
+  relationship_name: CAN_READ
+# Map principals that can change or delete SSM parameters. Overwriting a
+# parameter another workload reads is a common tampering / escalation path.
+- target_label: AWSSSMParameter
+  permissions:
+  - ssm:PutParameter
+  - ssm:DeleteParameter
+  - ssm:DeleteParameters
+  - ssm:LabelParameterVersion
+  relationship_name: CAN_WRITE
+# Map principals whose IAM policies allow decrypting with a KMS key.
+# IAM side ONLY: the key policy is the primary control and is not evaluated.
+# An IAM grant only takes effect if the key policy delegates to the account,
+# and a key policy can grant access with no IAM policy at all. Read this edge
+# as "IAM allows it", not "can decrypt".
+- target_label: AWSKMSKey
+  permissions:
+  - kms:Decrypt
+  relationship_name: CAN_DECRYPT

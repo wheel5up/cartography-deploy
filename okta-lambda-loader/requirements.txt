@@ -1,0 +1,27 @@
+# Dependency set for the Okta Lambda loader handler.
+#
+# This is NOT `pip install cartography` — that pulls the full pyproject.toml
+# dependency list (azure-mgmt-*, msgraph-sdk, oci, kubernetes, google-cloud-*,
+# boto3-heavy AWS submodule imports, etc. — every provider cartography
+# supports), which is unnecessary bloat for a Lambda that only ever imports
+# cartography.intel.okta.
+#
+# Cartography's SOURCE (just the subset of the `cartography/` package this
+# handler needs) is vendored separately at build time by the Makefile — see
+# that file and README.md "Packaging strategy". Only the runtime dependencies
+# actually reached by `cartography.intel.okta`'s imports are listed here,
+# discovered empirically by import-testing locally under Python 3.13 (see
+# README.md "How this list was derived").
+#
+# NOTE: cartography/util.py (imported transitively by cartography.intel.okta
+# via cartography.client.core.tx) imports boto3/botocore even though this
+# handler never calls any AWS API — util.py's AWS-pagination/retry helpers
+# are generic utilities cartography's core shares across all providers, not
+# Okta-specific code. boto3 is listed here for that reason, not because the
+# Okta sync itself talks to AWS.
+
+boto3>=1.40.0
+neo4j>=6.0.0
+okta>=3.4.4
+backoff>=2.1.2
+statsd>=4.0.0

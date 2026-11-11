@@ -1,0 +1,13 @@
+# Runtime deps for the Kandji Lambda loader. NOT `pip install cartography`;
+# cartography's source is vendored by the Makefile from the pinned fork tag.
+#
+# Derived by walking every import reachable from cartography.intel.kandji
+# (rc18): backoff, boto3/botocore, neo4j, requests, statsd. boto3 is needed
+# even though this loader calls no AWS API for sync, because
+# cartography/util.py imports it at module level; the handler also uses it
+# for SSM.
+boto3>=1.40.0
+neo4j>=6.0.0
+requests>=2.31.0
+backoff>=2.1.2
+statsd>=4.0.0

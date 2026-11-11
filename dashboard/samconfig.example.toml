@@ -1,0 +1,9 @@
+# Copy to samconfig.toml (gitignored) and fill in your values.
+version = 0.1
+
+[default.deploy.parameters]
+stack_name        = "cartography-dashboard"
+region            = "us-east-1"
+capabilities      = "CAPABILITY_IAM CAPABILITY_AUTO_EXPAND"
+confirm_changeset = false
+resolve_s3        = true

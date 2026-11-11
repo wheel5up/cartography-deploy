@@ -1,0 +1,13 @@
+# Runtime deps for the CrowdStrike Lambda loader. NOT `pip install cartography`;
+# cartography's source is vendored by the Makefile from the pinned fork tag.
+#
+# Derived by walking every import reachable from cartography.intel.crowdstrike:
+# falconpy (Hosts, Spotlight_Vulnerabilities, OAuth2), plus the core set every
+# loader needs (neo4j, boto3 for cartography/util.py + SSM, backoff, statsd,
+# requests).
+crowdstrike-falconpy>=1.4.0
+boto3>=1.40.0
+neo4j>=6.0.0
+requests>=2.31.0
+backoff>=2.1.2
+statsd>=4.0.0

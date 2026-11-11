@@ -1,0 +1,36 @@
+# Dependency set for the Vercel Lambda loader handler.
+#
+# This is NOT `pip install cartography` — that pulls the full pyproject.toml
+# dependency list (azure-mgmt-*, msgraph-sdk, oci, kubernetes, google-cloud-*,
+# boto3-heavy AWS submodule imports, etc. — every provider cartography
+# supports), which is unnecessary bloat for a Lambda that only ever imports
+# cartography.intel.vercel.
+#
+# Cartography's SOURCE (the `cartography/` package this handler needs) is
+# vendored separately at build time by the Makefile — see that file and
+# README.md "Packaging strategy". Only the runtime dependencies actually
+# reached by cartography.intel.vercel's imports (plus its own transitive
+# chain through cartography.client.core.tx / cartography.util) are listed
+# here, same derivation method ../okta-lambda-loader/requirements.txt used.
+#
+# NOTE: cartography/util.py (imported transitively via
+# cartography.client.core.tx) imports boto3/botocore even though this
+# handler never calls any AWS API — util.py's AWS-pagination/retry helpers
+# are generic utilities cartography's core shares across all providers, not
+# Vercel-specific code. boto3 is listed here for that reason, confirmed by
+# the same import-chain finding ../okta-lambda-loader/requirements.txt
+# documents for Okta.
+#
+# requests + urllib3 are listed explicitly even though boto3/botocore pull
+# in their own urllib3 transitively: cartography.intel.vercel calls
+# `requests.session()` and `from urllib3 import Retry` directly (see
+# cartography/intel/vercel/__init__.py and util.py), so both must be
+# present as top-level importable packages, not just as botocore's vendored
+# dependency.
+
+boto3>=1.40.0
+neo4j>=6.0.0
+requests>=2.31.0
+urllib3>=2.0.0
+backoff>=2.1.2
+statsd>=4.0.0

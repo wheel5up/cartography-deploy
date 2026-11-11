@@ -1,0 +1,13 @@
+# Copy to samconfig.toml (gitignored) and fill in your values.
+version = 0.1
+
+[default.deploy.parameters]
+stack_name   = "cartography-crowdstrike-lambda-loader"
+region       = "us-east-1"
+capabilities = "CAPABILITY_IAM CAPABILITY_NAMED_IAM"
+confirm_changeset = false
+resolve_s3   = true
+parameter_overrides = [
+  "VpcId=vpc-0123456789abcdef0",
+  "SubnetId=subnet-0123456789abcdef0"
+]

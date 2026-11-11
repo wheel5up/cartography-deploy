@@ -1,0 +1,38 @@
+# Dependency set for the Lambda loader handler.
+#
+# This is NOT `pip install cartography` — that pulls the fork's full
+# pyproject.toml dependency list (azure-mgmt-*, msgraph-sdk, oci, kubernetes,
+# google-cloud-*, okta, etc. — every provider cartography supports), which is
+# unnecessary bloat for a Lambda that only ever imports
+# cartography.intel.aws.{iam,kms,s3,dynamodb,rds,ssm,resourcegroupstaggingapi}.
+#
+# Cartography's SOURCE (the `cartography/` package directory) is vendored
+# separately at build time by the Makefile — see that file and README.md
+# "Packaging". Only cartography's *runtime dependencies actually
+# reached by AWS module imports* are listed here, discovered empirically by
+# import-testing under the `public.ecr.aws/lambda/python:3.13` image.
+#
+# IMPORTANT: cartography/intel/aws/__init__.py imports cartography/intel/aws/
+# resources.py at module load time, which unconditionally imports EVERY AWS
+# submodule (not just the ones this Lambda calls) to build the
+# RESOURCE_FUNCTIONS dispatch table. That pulls in httpx (ecr_image_layers),
+# types-aiobotocore-ecr (same), and cryptography (eks) even though this
+# handler's dispatch table (handler._build_sync_functions) never calls sync()
+# for ecr_image_layers or eks. If cartography's fork restructures resources.py
+# to lazy-import, revisit this list — it may shrink.
+
+boto3>=1.40.0
+aioboto3>=15.0.0
+neo4j>=6.0.0
+policyuniverse>=1.1.0.0
+marshmallow>=4.0.0
+backoff>=2.1.2
+statsd>=4.0.0
+dnspython>=2.0.0
+requests>=2.22.0
+pyyaml>=5.3.1
+packaging>=26.0.0
+packageurl-python>=0.17.0
+cryptography>=45.0.0
+httpx>=0.24.0
+types-aiobotocore-ecr>=3.1.0

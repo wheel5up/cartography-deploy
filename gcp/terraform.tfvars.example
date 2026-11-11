@@ -1,0 +1,9 @@
+# Copy to terraform.tfvars (gitignored) and fill in your values.
+project_id      = "my-cartography"
+host_org_id     = "123456789012"
+billing_account = "000000-000000-000000"
+aws_account_id  = "111111111111"
+
+scanned_org_ids = {
+  "example.com" = "123456789012"
+}

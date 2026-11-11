@@ -1,0 +1,108 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Cartography - Security Groups
+  Creates the Neo4j security group and writes its ID to SSM
+  (/cartography/sg/neo4j). Each Lambda loader stack adds its own Bolt
+  ingress rule to this group.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC that Neo4j and the loaders run in.
+
+  ClientCidr:
+    Type: String
+    Description: >
+      CIDR allowed to reach the Neo4j browser (7474) and Bolt (7687)
+      directly, e.g. the VPC CIDR or a VPN/WARP range.
+
+Resources:
+
+  Neo4jSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: cartography-neo4j-sg
+      GroupDescription: Neo4j - allows browser from ALB and Bolt from Cartography
+      VpcId: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value: cartography-neo4j-sg
+        - Key: Project
+          Value: cartography
+
+  # ------------------------------------------------------------------
+  # Neo4j rules
+  # ------------------------------------------------------------------
+  Neo4jIngressBrowserFromVpc:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref Neo4jSecurityGroup
+      IpProtocol: tcp
+      FromPort: 7474
+      ToPort: 7474
+      CidrIp: !Ref ClientCidr
+      Description: Neo4j browser from VPC (WARP)
+
+  Neo4jIngressBoltFromVpc:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref Neo4jSecurityGroup
+      IpProtocol: tcp
+      FromPort: 7687
+      ToPort: 7687
+      CidrIp: !Ref ClientCidr
+      Description: Bolt from VPC (WARP)
+
+  Neo4jEgressHttps:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref Neo4jSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: 0.0.0.0/0
+      Description: Outbound HTTPS
+
+  Neo4jEgressCloudflared:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref Neo4jSecurityGroup
+      IpProtocol: tcp
+      FromPort: 7844
+      ToPort: 7844
+      CidrIp: 0.0.0.0/0
+      Description: Outbound Cloudflare Tunnel (cloudflared)
+
+  Neo4jEgressCloudflaredUdp:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref Neo4jSecurityGroup
+      IpProtocol: udp
+      FromPort: 7844
+      ToPort: 7844
+      CidrIp: 0.0.0.0/0
+      Description: Outbound Cloudflare Tunnel QUIC (cloudflared)
+
+  Neo4jEgressHttp:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref Neo4jSecurityGroup
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      CidrIp: 0.0.0.0/0
+      Description: Outbound HTTP
+
+  # ------------------------------------------------------------------
+  # Write SG ID to SSM - other stacks read it as a plain parameter
+  # ------------------------------------------------------------------
+  SsmNeo4jSgId:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /cartography/sg/neo4j
+      Type: String
+      Value: !Ref Neo4jSecurityGroup
+
+Outputs:
+  Neo4jSecurityGroupId:
+    Value: !Ref Neo4jSecurityGroup

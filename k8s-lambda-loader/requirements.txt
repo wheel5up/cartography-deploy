@@ -1,0 +1,15 @@
+# Runtime deps for the Kubernetes (EKS) Lambda loader. NOT `pip install
+# cartography` — the full pyproject pulls every provider SDK. cartography's
+# source is vendored by the Makefile from the pinned fork tag.
+#
+# Derived from the third-party imports in cartography/intel/kubernetes/*.py
+# and cartography/analysis/kubernetes plus cartography core (util,
+# client.core.tx, graph, stats). Verified by import-testing the built artifact
+# in public.ecr.aws/lambda/python:3.13.
+boto3>=1.40.0
+neo4j>=6.0.0
+kubernetes>=22.6.0
+PyYAML>=6.0
+python-dateutil>=2.9.0
+backoff>=2.1.2
+statsd>=4.0.0

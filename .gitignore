@@ -1,0 +1,34 @@
+# AWS SAM build artifacts
+.aws-sam/
+
+# Temporary AWS credentials — never commit
+temp_key/
+
+# Salesforce JWT key pair (private key goes to SSM, then delete it)
+salesforce-cartography.key
+salesforce-cartography.crt
+
+# Python bytecode cache
+__pycache__/
+*.pyc
+
+# Local test/lint caches
+.pytest_cache/
+.ruff_cache/
+
+# github-lambda-loader: local timing runs (repo names, per-repo timings)
+github-lambda-loader/measurements/
+
+# Terraform (gcp/)
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+
+# Deployment config. Commit the *.example versions instead.
+samconfig.toml
+lambda-loader/account-splits.json
+gcp-lambda-loader/default-splits.json
+gcp/terraform.tfvars
+gcp/backend.hcl

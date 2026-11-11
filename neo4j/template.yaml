@@ -1,0 +1,288 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Cartography - Neo4j
+  Runs Neo4j 5 Community and cloudflared in Docker on an EC2 instance in a
+  private subnet. Writes instance ID and private IP to SSM for other stacks.
+
+# ============================================================================
+# READ BEFORE DEPLOYING
+#
+# Do NOT re-deploy this stack to "apply" config to a running instance:
+#   - Everything below is UserData, which only runs on first boot. Changing it
+#     stops/starts the instance but does not rewrite neo4j.conf or re-run
+#     docker. Change the running box via SSM instead (see README.md).
+#   - Updating BlockDeviceMappings/RootVolumeSize or AmiId REPLACES the
+#     instance, and the root volume (the whole graph) is DeleteOnTermination.
+# Always preview first: `sam deploy --no-execute-changeset` and refuse any
+# change set that shows Replacement on Neo4jInstance.
+# ============================================================================
+
+Parameters:
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Private subnet with outbound internet (NAT), same VPC as Neo4j.
+
+  InstanceType:
+    Type: String
+    Default: t3.xlarge
+    AllowedValues: [t3.medium, t3.large, t3.xlarge]
+
+  AmiId:
+    Type: AWS::EC2::Image::Id
+    Description: >
+      Amazon Linux 2023 x86_64 AMI ID in the deploy region. Look it up with
+      `aws ssm get-parameter --name
+      /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64`.
+      Pinned rather than resolved at deploy time because a new AMI ID
+      replaces the instance. UserData relies on AL2023 shipping the AWS CLI
+      (used to read the tunnel token).
+
+  RootVolumeSize:
+    Type: Number
+    Default: 100
+    Description: >
+      GB. Sized for a store of ~16 GB + tx logs capped at 20 GB + OS/Docker,
+      with headroom: a full disk stops Neo4j.
+
+  Neo4jImageTag:
+    Type: String
+    Default: 5.26.27-community
+    Description: >
+      Pinned neo4j Docker image tag (not the floating "5-community" tag).
+      Pinning matters here because the APOC Core jar is extracted from this
+      exact image at boot (see UserData) - a floating tag could drift to a
+      Neo4j version the bundled APOC jar no longer matches.
+
+  CloudflaredImageTag:
+    Type: String
+    Default: 2026.10.2
+    Description: >
+      Pinned cloudflare/cloudflared image tag. Check https://hub.docker.com/r/cloudflare/cloudflared/tags
+      before bumping.
+
+  TunnelTokenParameter:
+    Type: String
+    Default: /cartography/cloudflare/tunnel-token
+    Description: >
+      SSM SecureString holding the Cloudflare Tunnel token (optional; create it
+      before the first boot; see README.md "Cloudflare Tunnel"). Read at boot by UserData. If
+      missing, Neo4j still starts and cloudflared is skipped.
+
+  Neo4jPasswordParameter:
+    Type: String
+    Default: /cartography/neo4j/password
+    Description: >
+      SSM SecureString holding the password for the built-in `neo4j` user
+      (at least 8 characters). Create it before the first boot; see
+      README.md "Auth". Read at boot by UserData, and by every loader.
+
+  BoltAdvertisedAddress:
+    Type: String
+    Description: >
+      Value for server.bolt.advertised_address (host:port clients use to
+      reach Bolt, e.g. the Cloudflare Tunnel hostname).
+
+Resources:
+
+  Neo4jInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cartography-neo4j-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: ReadTunnelToken
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${TunnelTokenParameter}"
+        - PolicyName: ReadNeo4jPassword
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${Neo4jPasswordParameter}"
+      Tags:
+        - Key: Project
+          Value: cartography
+
+  Neo4jInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: cartography-neo4j-profile
+      Roles:
+        - !Ref Neo4jInstanceRole
+
+  Neo4jInstance:
+    Type: AWS::EC2::Instance
+    # If an update ever replaces the instance, keep the old one (and its root
+    # volume, i.e. the graph) instead of terminating it.
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Retain
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref SubnetId
+      IamInstanceProfile: !Ref Neo4jInstanceProfile
+      SecurityGroupIds:
+        - "{{resolve:ssm:/cartography/sg/neo4j}}"
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: !Ref RootVolumeSize
+            VolumeType: gp3
+            Encrypted: true
+            DeleteOnTermination: true
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          exec > /var/log/user-data.log 2>&1
+
+          dnf install -y python3-pip
+          pip3 install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-py3-latest.tar.gz
+          dnf install -y docker
+          systemctl enable docker
+          systemctl start docker
+
+          MOUNT_POINT=/neo4j-data
+          mkdir -p $MOUNT_POINT/{data,logs,import,plugins,conf}
+
+          # No dbms.ssl.policy.bolt.* lines: TLS is disabled, and with the
+          # policy enabled Neo4j refuses to start if the cert/key files are
+          # absent (nothing here creates them).
+          {
+            echo "server.default_listen_address=0.0.0.0"
+            echo "server.bolt.enabled=true"
+            # Every *-lambda-loader connects to bolt://<private-ip>:8443.
+            echo "server.bolt.listen_address=0.0.0.0:8443"
+            echo "server.bolt.advertised_address=${BoltAdvertisedAddress}"
+            # Plain Bolt inside the VPC; loaders use bolt://, not bolt+s://.
+            echo "server.bolt.tls_level=DISABLED"
+            echo "server.http.enabled=true"
+            echo "server.http.listen_address=0.0.0.0:7474"
+            echo "server.https.enabled=false"
+            # neo4j-admin server memory-recommendation --memory=15g --docker
+            # (t3.xlarge, 16 GiB). Re-run it if you change InstanceType.
+            echo "server.memory.heap.initial_size=5g"
+            echo "server.memory.heap.max_size=5g"
+            echo "server.memory.pagecache.size=6400m"
+            echo "server.jvm.additional=-XX:+ExitOnOutOfMemoryError"
+            # Size cap, not the 2-day default: a time-based policy lets a
+            # heavy night of writes (e.g. a large Inspector sync) fill the disk.
+            echo "db.tx_log.rotation.retention_policy=20G size"
+            # apoc.meta.* (schema introspection, used by the neo4j-mcp-server)
+            # touches internal APIs and is sandboxed by Neo4j's procedure
+            # security model by default. Unrestrict only the meta package
+            # (least-privilege) rather than all of apoc.*.
+            echo "dbms.security.procedures.unrestricted=apoc.meta.*"
+          } > $MOUNT_POINT/conf/neo4j.conf
+
+          docker pull neo4j:${Neo4jImageTag}
+
+          # --- APOC Core plugin (pinned to match Neo4j exactly) -------------
+          # The neo4j Docker image ships APOC Core in /var/lib/neo4j/labs/ but
+          # does not load it automatically. Extract the jar from the pinned
+          # image (no network download required - avoids depending on GitHub
+          # releases and guarantees an exact version match) and place it in
+          # the /plugins bind mount.
+          #
+          # IMPORTANT: the jar must be readable by the container's neo4j user
+          # (uid 7474). A jar left root-owned with mode 0700 (e.g. from a
+          # plain `docker cp`) is unreadable to that user and Neo4j fails to
+          # start with a misleading "Some jar procedure files ... are invalid"
+          # ZipException - it's actually a permissions error, not a corrupt
+          # jar. chown/chmod explicitly rather than relying on the copy's
+          # source permissions.
+          APOC_CID=$(docker create neo4j:${Neo4jImageTag})
+          docker cp "$APOC_CID":/var/lib/neo4j/labs/. /tmp/neo4j-labs/
+          docker rm "$APOC_CID" >/dev/null
+          cp /tmp/neo4j-labs/apoc-*-core.jar $MOUNT_POINT/plugins/
+          chown 7474:7474 $MOUNT_POINT/plugins/apoc-*-core.jar
+          chmod 644 $MOUNT_POINT/plugins/apoc-*-core.jar
+          rm -rf /tmp/neo4j-labs
+
+          # The image sets the neo4j user's password from NEO4J_AUTH only on
+          # first start (empty /data). A missing parameter fails the boot.
+          set +x
+          DB_PASSWORD=$(aws ssm get-parameter --region ${AWS::Region} \
+            --name "${Neo4jPasswordParameter}" --with-decryption \
+            --query Parameter.Value --output text)
+          docker run -d \
+            --name neo4j \
+            --restart unless-stopped \
+            -p 7474:7474 \
+            -p 8443:8443 \
+            -v $MOUNT_POINT/data:/data \
+            -v $MOUNT_POINT/logs:/logs \
+            -v $MOUNT_POINT/import:/var/lib/neo4j/import \
+            -v $MOUNT_POINT/plugins:/plugins \
+            -v $MOUNT_POINT/conf/neo4j.conf:/conf/neo4j.conf \
+            -e NEO4J_AUTH="neo4j/$DB_PASSWORD" \
+            neo4j:${Neo4jImageTag}
+          unset DB_PASSWORD
+          set -x
+
+          # --- cloudflared (Cloudflare Tunnel -> Cloudflare Access browser) -
+          # Outbound only (7844 tcp/udp,
+          # opened in cartography-network). The tunnel's public hostname ->
+          # origin mapping lives in the Cloudflare Zero Trust dashboard, not
+          # here. Token is read from SSM at boot and never written to disk.
+          # A missing token must not block Neo4j, so failures only warn.
+          set +x
+          TUNNEL_TOKEN=$(aws ssm get-parameter --region ${AWS::Region} \
+            --name "${TunnelTokenParameter}" --with-decryption \
+            --query Parameter.Value --output text 2>/dev/null || true)
+          if [ -n "$TUNNEL_TOKEN" ] && [ "$TUNNEL_TOKEN" != "None" ]; then
+            docker run -d \
+              --name cloudflared \
+              --restart unless-stopped \
+              cloudflare/cloudflared:${CloudflaredImageTag} \
+              tunnel --no-autoupdate run --token "$TUNNEL_TOKEN"
+            echo "cloudflared started"
+          else
+            echo "WARNING: ${TunnelTokenParameter} not readable; cloudflared not started"
+          fi
+          unset TUNNEL_TOKEN
+          set -x
+
+          echo "UserData complete"
+
+      Tags:
+        - Key: Name
+          Value: cartography-neo4j
+        - Key: Project
+          Value: cartography
+
+  # ------------------------------------------------------------------
+  # Write instance info to SSM - other stacks read as plain parameters
+  # ------------------------------------------------------------------
+  SsmNeo4jInstanceId:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /cartography/neo4j/instance-id
+      Type: String
+      Value: !Ref Neo4jInstance
+
+  SsmNeo4jPrivateIp:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /cartography/neo4j/private-ip
+      Type: String
+      Value: !GetAtt Neo4jInstance.PrivateIp
+
+Outputs:
+  Neo4jInstanceId:
+    Value: !Ref Neo4jInstance
+  Neo4jPrivateIp:
+    Value: !GetAtt Neo4jInstance.PrivateIp

@@ -1,0 +1,63 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Cartography - Org-Wide Read-Only Role StackSet
+  Deploys cartography-read-only IAM role to every account in the organization.
+  Deployed once from the management account using SERVICE_MANAGED mode.
+  New accounts joining the org are enrolled automatically.
+
+Parameters:
+  HubAccountId:
+    Type: String
+    AllowedPattern: "[0-9]{12}"
+    Description: The cartography hub account that will assume this role.
+
+Resources:
+
+  CartographyReadOnlyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cartography-read-only
+      Description: >
+        Assumed by the cartography loader in the hub account to read
+        AWS resource metadata for security graph ingestion.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${HubAccountId}:root"
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/SecurityAudit
+        - arn:aws:iam::aws:policy/AmazonInspector2ReadOnlyAccess
+      Policies:
+        # Calls cartography (v0.0.1rc18+) makes that the AWS-managed
+        # SecurityAudit policy does NOT grant. Without these the syncs still
+        # succeed but log AccessDenied and silently drop the edges below.
+        #   lambda:GetFunction       -> container-image Lambda to its image
+        #                               (lambda_function.get_lambda_image_uris;
+        #                               ListFunctions omits Code.ImageUri).
+        #                               Also returns a short-lived presigned
+        #                               code-download URL; accepted.
+        #   codebuild:BatchGetBuilds -> ECR image to its source repo via the
+        #                               CodeBuild build that produced it
+        #                               (codebuild_supply_chain._get_builds).
+        - PolicyName: CartographyReadExtras
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:GetFunction
+                  - codebuild:BatchGetBuilds
+                Resource: "*"
+      Tags:
+        - Key: Project
+          Value: cartography
+        - Key: ManagedBy
+          Value: cloudformation-stackset
+
+Outputs:
+  CartographyReadOnlyRoleArn:
+    Description: ARN of the cartography-read-only role in this account
+    Value: !GetAtt CartographyReadOnlyRole.Arn

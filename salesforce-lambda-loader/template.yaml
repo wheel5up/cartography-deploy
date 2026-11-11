@@ -1,0 +1,310 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Cartography - Salesforce Lambda Loader. One Lambda, one Step Functions
+  state machine (one execution = one invocation), one EventBridge schedule
+  (daily 08:30 UTC, created DISABLED). Salesforce ingestion (org, profiles,
+  roles, internal users, permission sets, groups, connected apps) fits in a
+  single invocation, so there is no orchestrator or splits list. See
+  README.md.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC that Neo4j and the loaders run in.
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Private subnet with outbound internet (NAT), same VPC as Neo4j.
+
+  LambdaMemoryMb:
+    Type: Number
+    Default: 512
+    Description: >
+      Internal users only, so the working set is small. Raise if
+      SalesforceUserTypes is widened to include community users.
+
+  SalesforceUserTypes:
+    Type: String
+    Default: Standard
+    Description: >
+      Comma-separated User.UserType values to ingest. "Standard" is every
+      internal licence (Salesforce, Salesforce Integration, ...). Excludes
+      Experience Cloud / community users (CspLitePortal,
+      PowerCustomerSuccess, etc.). Add CsnOnly for Chatter Free users.
+
+  SalesforceMinUsersForCleanup:
+    Type: Number
+    Default: 1
+    Description: >
+      Refuse SalesforceUser cleanup when a run fetches fewer users than this.
+      Guards against an integration user without View All Users getting a
+      partial (but 200) user list and deleting the rest from the graph. Raise
+      to a floor below the real count (e.g. 80% of it) after the first run.
+
+  ScheduleDefault:
+    Type: String
+    Default: "cron(30 8 * * ? *)"
+    Description: >
+      Seed for /cartography/salesforce-lambda/schedule. Each loader has its
+      own default slot so runs don't overlap; keep this before the ontology
+      loader (10:00 UTC).
+
+Resources:
+
+  # ── Networking ─────────────────────────────────────────────────────────
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: cartography-salesforce-lambda-loader-sg
+      GroupDescription: Cartography Salesforce Lambda loader - outbound only
+      VpcId: !Ref VpcId
+      Tags:
+        - { Key: Name, Value: cartography-salesforce-lambda-loader-sg }
+        - { Key: Project, Value: cartography }
+
+  LambdaEgressHttps:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref LambdaSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: 0.0.0.0/0
+      Description: Outbound HTTPS (Salesforce API, SSM)
+
+  LambdaEgressNeo4jBolt:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref LambdaSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8443
+      ToPort: 8443
+      DestinationSecurityGroupId: "{{resolve:ssm:/cartography/sg/neo4j}}"
+      Description: Bolt 8443 to Neo4j
+
+  Neo4jIngressFromSalesforceLambda:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: "{{resolve:ssm:/cartography/sg/neo4j}}"
+      IpProtocol: tcp
+      FromPort: 8443
+      ToPort: 8443
+      SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      Description: Bolt 8443 from Cartography Salesforce Lambda loader
+
+  # ── Lambda ─────────────────────────────────────────────────────────────
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cartography-salesforce-lambda-loader-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: ReadNeo4jPassword
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cartography/neo4j/password"
+        - PolicyName: ReadSalesforceConfig
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ssm:GetParameters
+                Resource:
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cartography/salesforce/login-url"
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cartography/salesforce/client-id"
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cartography/salesforce/username"
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cartography/salesforce/private-key"
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cartography/salesforce/client-secret"
+      Tags:
+        - { Key: Project, Value: cartography }
+
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /cartography/salesforce-lambda-loader
+      RetentionInDays: 30
+
+  SalesforceLoaderFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: cartography-salesforce-lambda-loader
+      Handler: handler.handler
+      Runtime: python3.13
+      Architectures: [x86_64]
+      CodeUri: .
+      MemorySize: !Ref LambdaMemoryMb
+      Timeout: 900
+      Role: !GetAtt LambdaExecutionRole.Arn
+      VpcConfig:
+        SecurityGroupIds: [!Ref LambdaSecurityGroup]
+        SubnetIds: [!Ref SubnetId]
+      LoggingConfig:
+        LogGroup: !Ref LambdaLogGroup
+      Environment:
+        Variables:
+          NEO4J_URI: "bolt://{{resolve:ssm:/cartography/neo4j/private-ip}}:8443"
+          NEO4J_PASSWORD_SSM_PARAM: /cartography/neo4j/password
+          NEO4J_MAX_CONNECTION_LIFETIME: "200"
+          SALESFORCE_USER_TYPES: !Ref SalesforceUserTypes
+          SALESFORCE_MIN_USERS_FOR_CLEANUP: !Ref SalesforceMinUsersForCleanup
+          # SSM parameter NAMES only. The handler reads them at invoke time,
+          # so the stack deploys before they exist and a value change takes
+          # effect on the next run without a redeploy. Private key never
+          # becomes an env var.
+          SALESFORCE_SSM_PREFIX: /cartography/salesforce
+      Tags:
+        Project: cartography
+
+  # ── Step Functions: one execution = one invocation ─────────────────────
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cartography-salesforce-lambda-statemachine-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: states.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeLoaderLambda
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt SalesforceLoaderFunction.Arn
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: "*"
+      Tags:
+        - { Key: Project, Value: cartography }
+
+  StateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /cartography/scheduler/salesforce-lambda
+      RetentionInDays: 30
+
+  # Input: {} or {"update_tag": <int>}. A handler-reported FAILED becomes a
+  # Fail state so the execution is red and the error is in the cause.
+  SalesforceSyncStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: cartography-salesforce-lambda-sync
+      RoleArn: !GetAtt StateMachineRole.Arn
+      LoggingConfiguration:
+        Level: ERROR
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup: { LogGroupArn: !GetAtt StateMachineLogGroup.Arn }
+      DefinitionSubstitutions:
+        Fn: !GetAtt SalesforceLoaderFunction.Arn
+      Definition:
+        QueryLanguage: JSONata
+        StartAt: Invoke
+        States:
+          Invoke:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Arguments:
+              FunctionName: "${Fn}"
+              Payload: "{% $states.input %}"
+            Retry:
+              - ErrorEquals: [Lambda.ServiceException, Lambda.AWSLambdaException, Lambda.SdkClientException, Lambda.TooManyRequestsException]
+                IntervalSeconds: 2
+                MaxAttempts: 2
+                BackoffRate: 2
+            Output: "{% $states.result.Payload %}"
+            Next: Succeeded?
+          Succeeded?:
+            Type: Choice
+            Choices:
+              - Condition: "{% $states.input.status = 'SUCCEEDED' %}"
+                Next: Done
+            Default: SyncFailed
+          Done:
+            Type: Succeed
+          SyncFailed:
+            Type: Fail
+            Error: SalesforceSyncFailed
+            Cause: "{% $string($states.input) %}"
+
+  # ── Schedule ───────────────────────────────────────────────────────────
+  # Created DISABLED: enable after the integration user exists and a manual
+  # run checks out (see README.md "Schedule").
+  ScheduleParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /cartography/salesforce-lambda/schedule
+      Type: String
+      Value: !Ref ScheduleDefault
+      Tags: { Project: cartography }
+
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cartography-salesforce-lambda-scheduler-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: scheduler.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StartStateMachine
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref SalesforceSyncStateMachine
+      Tags:
+        - { Key: Project, Value: cartography }
+
+  # Change State here, not via the CLI (a CLI flip is reverted by sam deploy).
+  SalesforceLambdaSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: cartography-salesforce-lambda-daily
+      State: DISABLED
+      ScheduleExpression: !Sub "{{resolve:ssm:${ScheduleParameter}}}"
+      ScheduleExpressionTimezone: UTC
+      FlexibleTimeWindow: { Mode: "OFF" }
+      Target:
+        Arn: !Ref SalesforceSyncStateMachine
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: "{}"
+
+Outputs:
+  SyncStateMachineArn:
+    Value: !Ref SalesforceSyncStateMachine
+  FunctionArn:
+    Value: !GetAtt SalesforceLoaderFunction.Arn
+  LambdaLogGroup:
+    Value: !Ref LambdaLogGroup

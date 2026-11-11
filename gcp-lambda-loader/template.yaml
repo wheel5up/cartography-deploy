@@ -1,0 +1,656 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Cartography - GCP Lambda Loader. One Lambda (one invocation = one GCP org),
+  a single-task sync state machine, an orchestrator that runs every org split
+  from SSM in order under one shared update_tag, and a daily schedule. GCP
+  auth is Workload Identity Federation (no keys); the GCP side lives in
+  ../gcp/ (Terraform). See README.md.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Same VPC as every other cartography stack in this repo.
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Same private subnet as Neo4j and the other loaders.
+
+  LambdaMemoryMb:
+    Type: Number
+    Default: 2048
+    Description: >
+      Starting point. The sync is API-bound, but Lambda CPU scales with
+      memory and the Google client libraries are heavy to import. Tune from
+      Max Memory Used in the Lambda logs.
+
+  GcpServiceAccount:
+    Type: String
+    Description: SA the Lambda impersonates (terraform output service_account_email).
+
+  GcpWifAudience:
+    Type: String
+    Description: WIF provider audience (terraform output lambda_credential_config .audience).
+
+  DefaultSplitsJson:
+    Type: String
+    Description: >
+      Seed for /cartography/gcp-lambda/default-splits. One entry = one Lambda
+      invocation. An org that fits in 900s gets one entry. A larger org is
+      split into project batches: N entries with the same org_id,
+      "project_batch_count": N and "project_batch_index" 0..N-1 (every index
+      must be present). Batched orgs defer their shared cleanup to the
+      orchestrator's Finalize step, which runs only if every batch of every
+      batched org succeeded. A project too slow to share a batch is isolated:
+      one entry with "include_projects": [id] (listed first, so a failure shows
+      early), and every other entry of that org lists the same IDs in
+      "exclude_projects" (removed before batching). Finalize also requires the
+      excludes to equal the union of the includes, so no project is dropped.
+      Optional "requested_syncs" limits an entry to
+      some resource types (debugging only; keep iam, policy_bindings,
+      permission_relationships and compute together). CloudFormation only
+      seeds this on create; edit with `aws ssm put-parameter --overwrite`.
+
+  ScheduleDefault:
+    Type: String
+    Default: "cron(0 1 * * ? *)"
+    Description: >
+      Seed for /cartography/gcp-lambda/schedule. Default 01:00 UTC; each
+      loader has its own default slot so runs don't overlap. Keep this before
+      the ontology loader (10:00 UTC).
+
+  ScheduleState:
+    Type: String
+    Default: ENABLED
+    AllowedValues: [ENABLED, DISABLED]
+    Description: >
+      An existing stack keeps its previous value, so change it with
+      `sam deploy --parameter-overrides ScheduleState=...` (a CLI change to
+      the schedule is reverted by the next deploy).
+
+Resources:
+
+  # ── Networking ─────────────────────────────────────────────────────────
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: cartography-gcp-lambda-loader-sg
+      GroupDescription: Cartography GCP Lambda loader - outbound only
+      VpcId: !Ref VpcId
+      Tags:
+        - { Key: Name, Value: cartography-gcp-lambda-loader-sg }
+        - { Key: Project, Value: cartography }
+
+  LambdaEgressHttps:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref LambdaSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: 0.0.0.0/0
+      Description: Outbound HTTPS (Google APIs, AWS STS)
+
+  LambdaEgressNeo4jBolt:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref LambdaSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8443
+      ToPort: 8443
+      DestinationSecurityGroupId: "{{resolve:ssm:/cartography/sg/neo4j}}"
+      Description: Bolt 8443 to Neo4j
+
+  Neo4jIngressFromGcpLambda:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: "{{resolve:ssm:/cartography/sg/neo4j}}"
+      IpProtocol: tcp
+      FromPort: 8443
+      ToPort: 8443
+      SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      Description: Bolt 8443 from Cartography GCP Lambda loader
+
+  # ── Lambda ─────────────────────────────────────────────────────────────
+  # The role NAME is load-bearing: ../gcp/main.tf's WIF provider only accepts
+  # arn:aws:sts::<acct>:assumed-role/cartography-gcp-lambda-loader-role/*.
+  # Beyond VPC ENIs it only reads the Neo4j password; the STS
+  # GetCallerIdentity request google-auth signs requires no IAM permission.
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cartography-gcp-lambda-loader-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: ReadNeo4jPassword
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cartography/neo4j/password"
+      Tags:
+        - { Key: Project, Value: cartography }
+
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /cartography/gcp-lambda-loader
+      RetentionInDays: 30
+
+  GcpLoaderFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: cartography-gcp-lambda-loader
+      Handler: handler.handler
+      Runtime: python3.13
+      Architectures: [x86_64]
+      CodeUri: .
+      MemorySize: !Ref LambdaMemoryMb
+      Timeout: 900
+      Role: !GetAtt LambdaExecutionRole.Arn
+      VpcConfig:
+        SecurityGroupIds: [!Ref LambdaSecurityGroup]
+        SubnetIds: [!Ref SubnetId]
+      LoggingConfig:
+        LogGroup: !Ref LambdaLogGroup
+      Environment:
+        Variables:
+          NEO4J_URI: "bolt://{{resolve:ssm:/cartography/neo4j/private-ip}}:8443"
+          NEO4J_PASSWORD_SSM_PARAM: /cartography/neo4j/password
+          NEO4J_MAX_CONNECTION_LIFETIME: "200"
+          GCP_SERVICE_ACCOUNT: !Ref GcpServiceAccount
+          GCP_WIF_AUDIENCE: !Ref GcpWifAudience
+      Tags:
+        Project: cartography
+
+  # ── Step Functions: shared role ────────────────────────────────────────
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cartography-gcp-lambda-statemachine-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: states.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeLoaderLambda
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt GcpLoaderFunction.Arn
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: "*"
+      Tags:
+        - { Key: Project, Value: cartography }
+
+  StateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /cartography/scheduler/gcp-lambda-loader
+      RetentionInDays: 30
+
+  # ── State machine #1: single-task sync (one execution = one org) ──────
+  # Input: {"org_id": "...", "requested_syncs"?: "...", "update_tag"?: <int>}
+  GcpSyncStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: cartography-gcp-lambda-sync
+      RoleArn: !GetAtt StateMachineRole.Arn
+      LoggingConfiguration:
+        Level: ERROR
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StateMachineLogGroup.Arn
+      DefinitionSubstitutions:
+        LoaderFunctionArn: !GetAtt GcpLoaderFunction.Arn
+      Definition:
+        QueryLanguage: JSONata
+        Comment: >
+          One Lambda invocation (one org, one project batch of an org, or a
+          finalize). The input is passed to the handler unchanged; see
+          src/handler.py for the contract. Fails if the handler reports FAILED.
+        StartAt: InvokeLoader
+        States:
+          InvokeLoader:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Arguments:
+              FunctionName: "${LoaderFunctionArn}"
+              Payload: "{% $states.input %}"
+            # Service-level retries only. A timeout or handler FAILED is real.
+            Retry:
+              - ErrorEquals:
+                  - Lambda.ServiceException
+                  - Lambda.AWSLambdaException
+                  - Lambda.SdkClientException
+                  - Lambda.TooManyRequestsException
+                IntervalSeconds: 2
+                MaxAttempts: 2
+                BackoffRate: 2
+            Catch:
+              - ErrorEquals: ["States.ALL"]
+                Next: SyncFailed
+                Assign:
+                  catchError: "{% $states.errorOutput %}"
+            Assign:
+              invokeResult: "{% $states.result.Payload %}"
+            Output: {}
+            Next: EvalInvokeResult
+
+          EvalInvokeResult:
+            Type: Choice
+            Choices:
+              - Condition: "{% $invokeResult.status = 'SUCCEEDED' %}"
+                Next: SyncComplete
+            Default: SyncFailed
+
+          SyncComplete:
+            Type: Pass
+            Output: "{% $invokeResult %}"
+            End: true
+
+          # A real Fail state, not a Pass that returns a FAILED payload: a
+          # Pass ends the execution as SUCCEEDED and hides the failure.
+          SyncFailed:
+            Type: Fail
+            Error: GcpSyncFailed
+            Cause: "{% $exists($invokeResult) ? $string($invokeResult) : $string($catchError) %}"
+
+  # ── Splits list (SSM) ──────────────────────────────────────────────────
+  DefaultSplitsParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /cartography/gcp-lambda/default-splits
+      Type: String
+      Value: !Ref DefaultSplitsJson
+      Description: >
+        JSON array of {"org_id", "name"?, "requested_syncs"?,
+        "project_batch_index"?, "project_batch_count"?, "include_projects"?,
+        "exclude_projects"?} splits, run in order
+        by cartography-gcp-lambda-orchestrator.
+      Tags:
+        Project: cartography
+
+  # ── State machine #2: orchestrator ─────────────────────────────────────
+  # Runs every split serially under one shared update_tag. A failed split does
+  # NOT stop the rest (orgs and batches are independent; each project's own
+  # cleanup is scoped to that project). Org-wide cleanup for batched orgs is
+  # deferred to one Finalize step after the Map, which runs only if every
+  # batch succeeded. The execution ends in a Fail state if any split failed
+  # or Finalize did not run, so alarms and the dashboard see it.
+  #
+  # Input: {} (splits from SSM) or {"splits": [...]} (manual override).
+  OrchestratorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cartography-gcp-lambda-orchestrator-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: states.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ReadDefaultSplits
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cartography/gcp-lambda/default-splits"
+        - PolicyName: InvokeNestedSync
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref GcpSyncStateMachine
+              - Effect: Allow
+                Action:
+                  - states:DescribeExecution
+                  - states:StopExecution
+                Resource: !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:cartography-gcp-lambda-sync:*"
+              - Effect: Allow
+                Action:
+                  - events:PutTargets
+                  - events:PutRule
+                  - events:DescribeRule
+                Resource: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsForStepFunctionsExecutionRule"
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: "*"
+      Tags:
+        - { Key: Project, Value: cartography }
+
+  OrchestratorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /cartography/scheduler/gcp-lambda-orchestrator
+      RetentionInDays: 30
+
+  GcpOrchestratorStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: cartography-gcp-lambda-orchestrator
+      RoleArn: !GetAtt OrchestratorRole.Arn
+      LoggingConfiguration:
+        Level: ERROR
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt OrchestratorLogGroup.Arn
+      DefinitionSubstitutions:
+        SyncStateMachineArn: !Ref GcpSyncStateMachine
+      Definition:
+        QueryLanguage: JSONata
+        Comment: >
+          Runs each GCP split (an org, or one project batch of a large org) in
+          order under one update_tag, then Finalize (batched orgs' shared
+          cleanup + analysis jobs) if every batch succeeded. Fails at the end
+          if any split or Finalize failed, or Finalize was skipped.
+        StartAt: ResolveSplits
+        States:
+          # Tag generated once, before the Map: Map iterations cannot see
+          # each other's variables (see ../okta-lambda-loader/template.yaml).
+          ResolveSplits:
+            Type: Choice
+            Choices:
+              - Condition: "{% $exists($states.input.splits) and $count($states.input.splits) > 0 %}"
+                Assign:
+                  splits: "{% $states.input.splits %}"
+                  sharedUpdateTag: "{% $floor($millis() / 1000) %}"
+                Next: RunSplits
+            Default: GetDefaultSplits
+
+          GetDefaultSplits:
+            Type: Task
+            Resource: arn:aws:states:::aws-sdk:ssm:getParameter
+            Arguments:
+              Name: /cartography/gcp-lambda/default-splits
+            Assign:
+              splits: "{% $parse($states.result.Parameter.Value) %}"
+              sharedUpdateTag: "{% $floor($millis() / 1000) %}"
+            Output: {}
+            Next: RunSplits
+
+          RunSplits:
+            Type: Map
+            Items: "{% $splits %}"
+            ItemSelector:
+              splitIndex: "{% $states.context.Map.Item.Index %}"
+              split: "{% $states.context.Map.Item.Value %}"
+              updateTag: "{% $sharedUpdateTag %}"
+            MaxConcurrency: 1
+            ItemProcessor:
+              ProcessorConfig:
+                Mode: INLINE
+              StartAt: RunOneSplit
+              States:
+                RunOneSplit:
+                  Type: Task
+                  Resource: arn:aws:states:::states:startExecution.sync:2
+                  Arguments:
+                    StateMachineArn: "${SyncStateMachineArn}"
+                    Name: |-
+                      {%
+                        "gcp-orch-"
+                        & $split($states.context.Execution.Name, "-")[0]
+                        & "-"
+                        & $string($states.input.splitIndex)
+                        & "-"
+                        & $string($millis())
+                      %}
+                    # The split entry minus "name", plus the run's shared tag.
+                    Input: "{% $merge([$sift($states.input.split, function($v, $k) { $k != 'name' }), {'update_tag': $states.input.updateTag}]) %}"
+                  Retry:
+                    - ErrorEquals:
+                        - StepFunctions.ExecutionLimitExceeded
+                        - StepFunctions.ServiceException
+                      IntervalSeconds: 2
+                      MaxAttempts: 3
+                      BackoffRate: 2
+                  Catch:
+                    - ErrorEquals: ["States.ALL"]
+                      Next: SplitFailed
+                      Assign:
+                        failedSplit: "{% $states.input.split %}"
+                        catchError: "{% $states.errorOutput %}"
+                  Assign:
+                    okSplit: "{% $states.input.split %}"
+                    okResult: "{% $states.result.Output %}"
+                  Output: {}
+                  Next: SplitComplete
+
+                SplitComplete:
+                  Type: Pass
+                  Output:
+                    orgId: "{% $okSplit.org_id %}"
+                    name: "{% $okSplit.name %}"
+                    status: SUCCEEDED
+                    batched: "{% $exists($okSplit.project_batch_count) or $exists($okSplit.include_projects) or $exists($okSplit.exclude_projects) %}"
+                    policyBindingsComplete: "{% $okResult.policyBindingsComplete = true %}"
+                    durationSeconds: "{% $okResult.durationSeconds %}"
+                  End: true
+
+                # Pass, not Fail: keep going with the other orgs. The
+                # orchestrator itself fails in CheckResults below.
+                SplitFailed:
+                  Type: Pass
+                  Output:
+                    orgId: "{% $failedSplit.org_id %}"
+                    name: "{% $failedSplit.name %}"
+                    status: FAILED
+                    batched: "{% $exists($failedSplit.project_batch_count) or $exists($failedSplit.include_projects) or $exists($failedSplit.exclude_projects) %}"
+                    error: "{% $string($catchError) %}"
+                  End: true
+            Assign:
+              results: "{% $states.result %}"
+            Output: {}
+            Next: PlanFinalize
+
+          # ── Finalize ──────────────────────────────────────────────
+          # Batched orgs deferred their inherited org/folder policy-binding
+          # cleanup. Run it (and the global analysis jobs) once, here, only if
+          # every split of every batched org succeeded: a failed batch's
+          # projects did not refresh their inherited bindings, so cleanup
+          # would delete live ones. Unbatched orgs already cleaned up inside
+          # their own run, so a failed small org does not block this.
+          # "Batched" here means any partial split (project batch, include or
+          # exclude). Validates that each batched org has every index 0..N-1,
+          # and that per org the include lists are disjoint, every other split
+          # of the org excludes the same set, and that set equals the union of
+          # the includes: otherwise a project would be skipped (or synced twice)
+          # and the run would still look like a success.
+          PlanFinalize:
+            Type: Pass
+            Assign:
+              batchedOrgs: "{% $distinct($splits[$exists(project_batch_count) or $exists(include_projects) or $exists(exclude_projects)].org_id) %}"
+              batchedOk: |-
+                {%
+                  (
+                    $partial := $splits[$exists(project_batch_count) or $exists(include_projects) or $exists(exclude_projects)];
+                    $batched := $splits[$exists(project_batch_count)];
+                    $key := function($a) { $string($sort($distinct($append([], $a)))) };
+                    $count($results[batched = true and status = 'FAILED']) = 0
+                    and $count($batched) = $sum([0, $map(
+                      $distinct($batched.org_id),
+                      function($o) { $batched[org_id = $o][0].project_batch_count }
+                    )])
+                    and $count($distinct($batched.(org_id & ':' & $string(project_batch_index)))) = $count($batched)
+                    and $count($distinct($partial.org_id)) = $count($filter($distinct($append([], $partial.org_id)), function($o) {(
+                      $inc := $append([], $partial[org_id = $o and $exists(include_projects)].include_projects);
+                      $rest := $splits[org_id = $o and $not($exists(include_projects))];
+                      $count($inc) = $count($distinct($inc))
+                      and $count($rest) > 0
+                      and $count($distinct($append([], $rest.$key(exclude_projects)))) = 1
+                      and $key($inc) = $key($rest[0].exclude_projects)
+                    )}))
+                  )
+                %}
+            Output: {}
+            Next: ShouldFinalize
+
+          ShouldFinalize:
+            Type: Choice
+            Choices:
+              - Condition: "{% $batchedOk %}"
+                Next: Finalize
+            Default: SkipFinalize
+
+          Finalize:
+            Type: Task
+            Resource: arn:aws:states:::states:startExecution.sync:2
+            Arguments:
+              StateMachineArn: "${SyncStateMachineArn}"
+              Name: |-
+                {% "gcp-orch-" & $split($states.context.Execution.Name, "-")[0] & "-finalize-" & $string($millis()) %}
+              Input:
+                finalize: true
+                update_tag: "{% $sharedUpdateTag %}"
+                cleanup_org_ids: "{% $append([], $batchedOrgs) %}"
+                policy_bindings_complete: "{% $count($results[batched = true and policyBindingsComplete != true]) = 0 %}"
+            Retry:
+              - ErrorEquals:
+                  - StepFunctions.ExecutionLimitExceeded
+                  - StepFunctions.ServiceException
+                IntervalSeconds: 2
+                MaxAttempts: 3
+                BackoffRate: 2
+            Catch:
+              - ErrorEquals: ["States.ALL"]
+                Next: CheckResults
+                Assign:
+                  finalizeStatus: FAILED
+                  finalizeError: "{% $string($states.errorOutput) %}"
+            Assign:
+              finalizeStatus: SUCCEEDED
+              finalizeError: ""
+            Output: {}
+            Next: CheckResults
+
+          SkipFinalize:
+            Type: Pass
+            Assign:
+              finalizeStatus: SKIPPED
+              finalizeError: "a batch of a batched org failed, or the batch/include/exclude splits do not cover every project exactly once; org/folder policy bindings preserved and analysis jobs not run"
+            Output: {}
+            Next: CheckResults
+
+          CheckResults:
+            Type: Choice
+            Choices:
+              - Condition: "{% $count($results[status = 'FAILED']) = 0 and $finalizeStatus = 'SUCCEEDED' %}"
+                Next: AllSucceeded
+            Default: SomeFailed
+
+          AllSucceeded:
+            Type: Pass
+            Output:
+              status: SUCCEEDED
+              updateTag: "{% $sharedUpdateTag %}"
+              finalize: "{% $finalizeStatus %}"
+              results: "{% $results %}"
+            End: true
+
+          SomeFailed:
+            Type: Fail
+            Error: GcpSplitsFailed
+            Cause: "{% $string({'updateTag': $sharedUpdateTag, 'finalize': $finalizeStatus, 'finalizeError': $finalizeError, 'failed': $results[status = 'FAILED'], 'succeeded': $results[status = 'SUCCEEDED'].name}) %}"
+
+  # ── Schedule ───────────────────────────────────────────────────────────
+  ScheduleParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /cartography/gcp-lambda/schedule
+      Type: String
+      Value: !Ref ScheduleDefault
+      Tags:
+        Project: cartography
+
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cartography-gcp-lambda-scheduler-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: scheduler.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StartOrchestrator
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref GcpOrchestratorStateMachine
+      Tags:
+        - { Key: Project, Value: cartography }
+
+  GcpLambdaSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: cartography-gcp-lambda-daily
+      Description: Daily cartography-gcp-lambda-orchestrator run (all org splits from SSM).
+      State: !Ref ScheduleState
+      ScheduleExpression: !Sub "{{resolve:ssm:${ScheduleParameter}}}"
+      ScheduleExpressionTimezone: UTC
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !Ref GcpOrchestratorStateMachine
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: "{}"
+
+Outputs:
+  FunctionArn:
+    Value: !GetAtt GcpLoaderFunction.Arn
+  LambdaRoleArn:
+    Value: !GetAtt LambdaExecutionRole.Arn
+  StateMachineArn:
+    Value: !Ref GcpSyncStateMachine
+  OrchestratorStateMachineArn:
+    Value: !Ref GcpOrchestratorStateMachine
+  ScheduleName:
+    Value: !Ref GcpLambdaSchedule

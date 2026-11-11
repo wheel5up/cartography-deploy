@@ -1,0 +1,12 @@
+# Runtime deps for the Salesforce Lambda loader. NOT `pip install cartography`;
+# cartography's source is vendored by the Makefile from the pinned fork tag.
+#
+# Same set as kandji-lambda-loader plus PyJWT[crypto]: salesforce/util.py
+# imports jwt at module level and signs the JWT bearer assertion with RS256.
+# boto3 is needed for cartography/util.py (module-level import) and SSM.
+boto3>=1.40.0
+neo4j>=6.0.0
+requests>=2.31.0
+backoff>=2.1.2
+statsd>=4.0.0
+PyJWT[crypto]>=2.0.0

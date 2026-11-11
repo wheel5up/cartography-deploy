@@ -1,0 +1,28 @@
+# Runtime deps for the GCP Lambda loader. NOT `pip install cartography`;
+# cartography's source is vendored by the Makefile from the pinned fork tag.
+#
+# Google deps mirror the fork's pyproject.toml GCP entries, plus what
+# cartography core imports (boto3 via util.py, yaml for the permission
+# relationships file, httpx for artifact_registry manifests, dateutil).
+# Exact pins: an unpinned SDK release can rename arguments cartography passes
+# (see ../cloudflare-lambda-loader/requirements.txt).
+boto3==1.43.125
+neo4j==6.4.1
+backoff==2.2.1
+statsd==4.0.1
+requests==2.34.2
+PyYAML==6.0.3
+python-dateutil==2.9.0.post0
+httpx==0.28.1
+# 2.200.0, not 2.201.0: 2.201.0's bundled compute.v1 doc dropped
+# returnPartialSuccess from aggregatedList, which intel/gcp/compute.py,
+# ssl_policy.py and target_https_proxy.py pass. 2.200.0 matches the fork's venv.
+google-api-python-client==2.200.0
+google-auth==2.62.1
+google-auth-httplib2==0.4.4
+google-cloud-storage==3.17.1
+google-cloud-resource-manager==1.19.0
+google-cloud-asset==4.5.0
+google-cloud-artifact-registry==1.23.0
+google-cloud-aiplatform==2.7.0
+google-cloud-run==0.16.2

@@ -1,0 +1,19 @@
+# Copy to samconfig.toml (gitignored) and fill in your values.
+version = 0.1
+
+[default.deploy.parameters]
+stack_name   = "cartography-neo4j"
+region       = "us-east-1"
+capabilities = "CAPABILITY_IAM CAPABILITY_NAMED_IAM"
+confirm_changeset = false
+resolve_s3   = true
+
+parameter_overrides = [
+  "SubnetId=subnet-0123456789abcdef0",
+  "InstanceType=t3.xlarge",
+  "AmiId=ami-0123456789abcdef0",
+  "RootVolumeSize=100",
+  "Neo4jImageTag=5.26.27-community",
+  "CloudflaredImageTag=2026.10.2",
+  "BoltAdvertisedAddress=neo4j-bolt.example.com:8443"
+]

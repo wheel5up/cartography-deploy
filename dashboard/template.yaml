@@ -1,0 +1,317 @@
+AWSTemplateFormatVersion: "2010-09-09"
+# LanguageExtensions must come first: it turns the YAML dashboard body below
+# into the JSON string CloudWatch requires (Fn::ToJsonString). No JSON in this file.
+Transform:
+  - AWS::LanguageExtensions
+  - AWS::Serverless-2016-10-31
+Description: >-
+  Cartography - one CloudWatch dashboard for every Lambda sync. Widgets find
+  loaders by name (SEARCH on lambda-sync / lambda-loader, and a custom widget
+  that lists cartography-*lambda-sync state machines), so a new loader that
+  follows the naming convention appears without editing this template.
+  See README.md.
+
+Parameters:
+  DashboardName:
+    Type: String
+    Default: cartography-lambda-syncs
+  Neo4jInstanceId:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /cartography/neo4j/instance-id
+    Description: Written by the neo4j stack.
+  LoaderLogGroups:
+    Type: CommaDelimitedList
+    Description: >-
+      Log groups searched by the Logs Insights widgets. The only list in this
+      stack: dashboards can't select log groups by prefix, so a new loader's log
+      group must be added here (see README). Keep it to loader groups; every
+      dashboard refresh scans them.
+    Default: >-
+      /cartography/lambda-loader,
+      /cartography/anthropic-lambda-loader,
+      /cartography/cloudflare-lambda-loader,
+      /cartography/crowdstrike-lambda-loader,
+      /cartography/gcp-lambda-loader,
+      /cartography/github-lambda-loader,
+      /cartography/k8s-lambda-loader,
+      /cartography/kandji-lambda-loader,
+      /cartography/okta-lambda-loader,
+      /cartography/ontology-lambda-loader,
+      /cartography/salesforce-lambda-loader,
+      /cartography/snowflake-lambda-loader,
+      /cartography/vercel-lambda-loader
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # Custom widget: last run per loader (src/status_widget.py)
+  # ---------------------------------------------------------------------------
+  StatusWidgetLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /cartography/dashboard-status-widget
+      RetentionInDays: 14
+
+  StatusWidgetFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: cartography-dashboard-status-widget
+      Description: CloudWatch custom widget - last run of every cartography-*lambda-sync state machine.
+      CodeUri: src/
+      Handler: status_widget.handler
+      Runtime: python3.13
+      Architectures: [arm64]
+      MemorySize: 256
+      Timeout: 60
+      LoggingConfig:
+        LogGroup: !Ref StatusWidgetLogGroup
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: states:ListStateMachines
+              Resource: "*"
+            - Effect: Allow
+              Action: states:ListExecutions
+              Resource: !Sub arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:cartography-*
+      Tags:
+        Project: cartography
+
+  # ---------------------------------------------------------------------------
+  # Dashboard
+  # ---------------------------------------------------------------------------
+  LambdaSyncsDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Ref DashboardName
+      DashboardBody:
+        Fn::ToJsonString:
+          start: -PT36H
+          widgets:
+            - type: text
+              x: 0
+              y: 0
+              width: 24
+              height: 2
+              properties:
+                markdown: >-
+                  ## Cartography Lambda syncs
+
+                  Health comes from each loader's `*-lambda-sync` state machine
+                  (one execution per account / split / org). Orchestrators report
+                  SUCCEEDED even when children fail, so they are shown for timing only.
+                  Loaders appear automatically when named `cartography-<name>-lambda-sync` /
+                  `-lambda-loader`. Source: `cartography-deploy/dashboard/`.
+
+            - type: custom
+              x: 0
+              y: 2
+              width: 24
+              height: 10
+              properties:
+                title: Last run per loader
+                endpoint: !GetAtt StatusWidgetFunction.Arn
+                updateOn:
+                  refresh: true
+                  resize: false
+                  timeRange: true
+
+            - type: metric
+              x: 0
+              y: 12
+              width: 12
+              height: 6
+              properties:
+                title: Failed sync executions per day (by loader)
+                region: !Ref AWS::Region
+                view: timeSeries
+                stacked: true
+                period: 86400
+                metrics:
+                  - - expression: >-
+                        FILL(SEARCH('{AWS/States,StateMachineArn} MetricName="ExecutionsFailed" StateMachineArn=lambda-sync', 'Sum', 86400), 0)
+                      id: failed
+                      label: ""
+                yAxis:
+                  left:
+                    min: 0
+                    showUnits: false
+
+            - type: metric
+              x: 12
+              y: 12
+              width: 12
+              height: 6
+              properties:
+                title: Succeeded sync executions per day (by loader)
+                region: !Ref AWS::Region
+                view: timeSeries
+                stacked: true
+                period: 86400
+                metrics:
+                  - - expression: >-
+                        FILL(SEARCH('{AWS/States,StateMachineArn} MetricName="ExecutionsSucceeded" StateMachineArn=lambda-sync', 'Sum', 86400), 0)
+                      id: succeeded
+                      label: ""
+                yAxis:
+                  left:
+                    min: 0
+                    showUnits: false
+
+            - type: metric
+              x: 0
+              y: 18
+              width: 12
+              height: 6
+              properties:
+                title: Longest Lambda invocation (900s = timeout)
+                region: !Ref AWS::Region
+                view: timeSeries
+                period: 3600
+                metrics:
+                  - - expression: >-
+                        SEARCH('{AWS/Lambda,FunctionName} MetricName="Duration" FunctionName=lambda-loader', 'Maximum', 3600) / 1000
+                      id: duration
+                      label: ""
+                yAxis:
+                  left:
+                    min: 0
+                    max: 960
+                    label: seconds
+                    showUnits: false
+                annotations:
+                  horizontal:
+                    - value: 900
+                      label: Lambda timeout
+                      color: "#d13212"
+
+            - type: metric
+              x: 12
+              y: 18
+              width: 12
+              height: 6
+              properties:
+                title: Lambda errors and throttles per hour (timeouts count as errors)
+                region: !Ref AWS::Region
+                view: timeSeries
+                stacked: true
+                period: 3600
+                metrics:
+                  - - expression: >-
+                        FILL(SEARCH('{AWS/Lambda,FunctionName} (MetricName="Errors" OR MetricName="Throttles") FunctionName=lambda-loader', 'Sum', 3600), 0)
+                      id: errors
+                      label: ""
+                yAxis:
+                  left:
+                    min: 0
+                    showUnits: false
+
+            - type: metric
+              x: 0
+              y: 24
+              width: 12
+              height: 6
+              properties:
+                title: End-to-end run time (orchestrators and AWS controller)
+                region: !Ref AWS::Region
+                view: timeSeries
+                period: 3600
+                metrics:
+                  - - expression: >-
+                        SEARCH('{AWS/States,StateMachineArn} MetricName="ExecutionTime" (StateMachineArn=lambda-orchestrator OR StateMachineArn=lambda-daily-controller)', 'Maximum', 3600) / 60000
+                      id: runtime
+                      label: ""
+                yAxis:
+                  left:
+                    min: 0
+                    label: minutes
+                    showUnits: false
+
+            - type: metric
+              x: 12
+              y: 24
+              width: 12
+              height: 6
+              properties:
+                title: Neo4j CPU (shared by every loader)
+                region: !Ref AWS::Region
+                view: timeSeries
+                period: 300
+                metrics:
+                  - - AWS/EC2
+                    - CPUUtilization
+                    - InstanceId
+                    - !Ref Neo4jInstanceId
+                    - stat: Average
+                      label: average
+                  - - "..."
+                    - stat: Maximum
+                      label: maximum
+                yAxis:
+                  left:
+                    min: 0
+                    max: 100
+                    showUnits: false
+
+            - type: log
+              x: 0
+              y: 30
+              width: 12
+              height: 7
+              properties:
+                title: Timeouts and errors by loader
+                region: !Ref AWS::Region
+                view: table
+                query:
+                  Fn::Join:
+                    - ""
+                    - - "SOURCE '"
+                      - Fn::Join: ["' | SOURCE '", !Ref LoaderLogGroups]
+                      # Lambda timeouts appear only as "Status: timeout" on the REPORT line.
+                      - "' | filter @message like /Status: timeout/ or @message like /^\\[ERROR\\]/"
+                      - " | fields @message like /Status: timeout/ as is_timeout"
+                      - " | stats sum(is_timeout) as timeouts, count(*) - sum(is_timeout) as errors by @log"
+                      - " | sort timeouts desc, errors desc"
+
+            - type: log
+              x: 12
+              y: 30
+              width: 12
+              height: 7
+              properties:
+                title: Surfaces skipped as unavailable (permission gaps)
+                region: !Ref AWS::Region
+                view: table
+                query:
+                  Fn::Join:
+                    - ""
+                    - - "SOURCE '"
+                      - Fn::Join: ["' | SOURCE '", !Ref LoaderLogGroups]
+                      # Cartography's "skipped" log line. Raw AccessDenied warnings are
+                      # excluded: AWS logs thousands per run (SCPs, opt-out regions).
+                      - "' | filter @message like /is unavailable \\(/"
+                      - " | stats count(*) as n by @log"
+                      - " | sort n desc"
+
+            - type: log
+              x: 0
+              y: 37
+              width: 24
+              height: 8
+              properties:
+                title: Latest errors and timeouts (newest first)
+                region: !Ref AWS::Region
+                view: table
+                query:
+                  Fn::Join:
+                    - ""
+                    - - "SOURCE '"
+                      - Fn::Join: ["' | SOURCE '", !Ref LoaderLogGroups]
+                      - "' | fields @timestamp, @log, @message"
+                      - " | filter @message like /Status: timeout/ or @message like /^\\[ERROR\\]/"
+                      - " | sort @timestamp desc"
+                      - " | limit 50"
+
+Outputs:
+  DashboardUrl:
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards/dashboard/${DashboardName}
+  StatusWidgetFunctionArn:
+    Value: !GetAtt StatusWidgetFunction.Arn

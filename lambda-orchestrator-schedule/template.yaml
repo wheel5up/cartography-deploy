@@ -1,0 +1,253 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Cartography - Lambda Orchestrator Daily Schedule.
+  EventBridge Scheduler triggers a thin "controller" Step Functions state
+  machine once a day. The controller runs the full-org cartography-lambda-
+  orchestrator sync, waits for it to completely finish, then runs a second
+  orchestrator pass scoped to resourcegroupstaggingapi only (at low
+  concurrency), since that module deadlocks under the main run's higher
+  concurrency (see ../lambda-loader/README.md).
+
+Parameters:
+  ScheduleExpression:
+    Type: String
+    Default: "cron(0 2 * * ? *)"
+    Description: >
+      EventBridge Scheduler expression for the nightly run. Default: 2:00 AM
+      UTC daily.
+
+  TaggingConcurrency:
+    Type: Number
+    Default: 3
+    Description: >
+      MaxConcurrency passed to the orchestrator's sync-override mode for the
+      resourcegroupstaggingapi-only sweep. 3 avoids the AWSTag lock
+      contention seen at higher concurrency; raising it can reintroduce
+      deadlock-driven timeouts (see ../lambda-loader/README.md "SSM
+      parameters").
+
+Resources:
+
+  # ── IAM role for the controller state machine ─────────────────────────────
+  # Needs to call cartography-lambda-orchestrator synchronously
+  # (states:startExecution.sync:2) twice per execution. Permission shape
+  # mirrors ../lambda-loader/template.yaml's own InvokeLambdaSyncStateMachine
+  # policy (that stack's orchestrator calling its own per-account sync state
+  # machine the same way) — states:StartExecution needs the STATE MACHINE
+  # arn; DescribeExecution/StopExecution need the EXECUTION arn (different
+  # resource shape); the events:* triple lets Step Functions use EventBridge
+  # instead of polling to learn when the nested execution completes.
+  #
+  # The orchestrator's ARN is constructed directly (not imported via
+  # Fn::ImportValue or read from SSM) — cartography-lambda-orchestrator is a
+  # hardcoded StateMachineName in ../lambda-loader/template.yaml, so the ARN
+  # is fully deterministic and never changes without a rename. Avoids adding
+  # a cross-stack export or a new SSM parameter for a static value.
+  ControllerStateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cartography-lambda-daily-controller-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeLambdaOrchestrator
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:cartography-lambda-orchestrator"
+              - Effect: Allow
+                Action:
+                  - states:DescribeExecution
+                  - states:StopExecution
+                Resource: !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:cartography-lambda-orchestrator:*"
+              - Effect: Allow
+                Action:
+                  - events:PutTargets
+                  - events:PutRule
+                  - events:DescribeRule
+                Resource: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsForStepFunctionsExecutionRule"
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: "*"
+      Tags:
+        - Key: Project
+          Value: cartography
+
+  # ── IAM role for EventBridge Scheduler ─────────────────────────────────────
+
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cartography-lambda-daily-scheduler-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StartControllerStateMachine
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref CartographyDailyControllerStateMachine
+      Tags:
+        - Key: Project
+          Value: cartography
+
+  # ── CloudWatch Log Group ────────────────────────────────────────────────────
+
+  ControllerStateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /cartography/scheduler/lambda-daily-controller
+      RetentionInDays: 30
+
+  # ── Controller state machine ────────────────────────────────────────────────
+  # Two sequential, BLOCKING (.sync:2) calls to cartography-lambda-orchestrator:
+  #   1. Full org sync (Input: {}) — normal account-splits path, all accounts.
+  #   2. resourcegroupstaggingapi-only sweep, low concurrency — sync-override
+  #      mode (see ../lambda-loader/template.yaml CheckSyncOverrideInput).
+  # Phase 2 never starts until phase 1 has FULLY completed (Step Functions'
+  # own .sync:2 semantics — no guessed time offset between two independent
+  # cron schedules). This also guarantees no
+  # account is ever mid-sync in both phases at once.
+  #
+  # Deliberately does NOT treat per-account failures inside either phase as a
+  # controller-level failure — cartography-lambda-orchestrator's own
+  # SummarizeResults always returns Step-Functions-status SUCCEEDED even when
+  # individual accounts/splits failed (failures are visible in its output,
+  # not its status — by design). The
+  # Catch blocks here only fire on a genuine EXECUTION-level failure of the
+  # orchestrator itself (e.g. malformed input rejected by its own
+  # ValidateInput/CheckSyncOverrideInput, or a Step Functions service error)
+  # — something that should never happen in normal operation, so it's treated
+  # as a loud Fail, not silently absorbed.
+  CartographyDailyControllerStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: cartography-lambda-daily-controller
+      RoleArn: !GetAtt ControllerStateMachineRole.Arn
+      LoggingConfiguration:
+        Level: ERROR
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt ControllerStateMachineLogGroup.Arn
+      DefinitionSubstitutions:
+        OrchestratorStateMachineArn: !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:cartography-lambda-orchestrator"
+        TaggingConcurrency: !Ref TaggingConcurrency
+      Definition:
+        QueryLanguage: JSONata
+        Comment: >
+          Runs cartography-lambda-orchestrator's full-org sync, waits for it
+          to completely finish, then runs a second orchestrator pass scoped
+          to resourcegroupstaggingapi only at low concurrency. See
+          ../lambda-loader/README.md for why resourcegroupstaggingapi must
+          run isolated from the main fan-out (AWSTag MERGE lock contention
+          under concurrency).
+        StartAt: RunFullOrgSync
+        States:
+
+          RunFullOrgSync:
+            Type: Task
+            Resource: arn:aws:states:::states:startExecution.sync:2
+            Arguments:
+              StateMachineArn: "${OrchestratorStateMachineArn}"
+              Name: "{% 'controller-' & $split($states.context.Execution.Name, '-')[0] & '-fullsync-' & $string($millis()) %}"
+              Input: {}
+            Catch:
+              - ErrorEquals: ["States.ALL"]
+                Assign:
+                  catchError: "{% $states.errorOutput %}"
+                Next: FullSyncFailed
+            Assign:
+              fullSyncResult: "{% $states.result.Output %}"
+            Output: {}
+            Next: RunTaggingSweep
+
+          FullSyncFailed:
+            Type: Fail
+            Error: FullOrgSyncFailed
+            Cause: "{% $string($catchError) %}"
+
+          RunTaggingSweep:
+            Type: Task
+            Resource: arn:aws:states:::states:startExecution.sync:2
+            Arguments:
+              StateMachineArn: "${OrchestratorStateMachineArn}"
+              Name: "{% 'controller-' & $split($states.context.Execution.Name, '-')[0] & '-tagging-' & $string($millis()) %}"
+              Input:
+                include: ["resourcegroupstaggingapi"]
+                exclude: []
+                concurrency: "${TaggingConcurrency}"
+            Catch:
+              - ErrorEquals: ["States.ALL"]
+                Assign:
+                  catchError: "{% $states.errorOutput %}"
+                Next: TaggingSweepFailed
+            Assign:
+              taggingSweepResult: "{% $states.result.Output %}"
+            Output: {}
+            Next: DailyRunComplete
+
+          TaggingSweepFailed:
+            Type: Fail
+            Error: TaggingSweepFailed
+            Cause: "{% $string($catchError) %}"
+
+          DailyRunComplete:
+            Type: Pass
+            Output:
+              status: SUCCEEDED
+              fullSync: "{% $fullSyncResult %}"
+              taggingSweep: "{% $taggingSweepResult %}"
+            End: true
+
+  # ── EventBridge Scheduler ────────────────────────────────────────────────
+
+  CartographyDailySchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: cartography-lambda-daily
+      Description: >
+        Triggers the daily cartography-lambda-daily-controller run (full org
+        sync, then resourcegroupstaggingapi sweep).
+      ScheduleExpression: !Ref ScheduleExpression
+      ScheduleExpressionTimezone: UTC
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !Ref CartographyDailyControllerStateMachine
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: "{}"
+
+Outputs:
+  ControllerStateMachineArn:
+    Value: !Ref CartographyDailyControllerStateMachine
+  ScheduleName:
+    Value: !Ref CartographyDailySchedule
+  ControllerStateMachineLogGroup:
+    Value: !Ref ControllerStateMachineLogGroup

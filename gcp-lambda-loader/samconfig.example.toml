@@ -1,0 +1,17 @@
+# Copy to samconfig.toml (gitignored) and fill in your values.
+# GcpServiceAccount and GcpWifAudience come from `terraform output` in ../gcp/.
+version = 0.1
+
+[default.deploy.parameters]
+stack_name   = "cartography-gcp-lambda-loader"
+region       = "us-east-1"
+capabilities = "CAPABILITY_IAM CAPABILITY_NAMED_IAM"
+confirm_changeset = false
+resolve_s3   = true
+parameter_overrides = [
+  "VpcId=vpc-0123456789abcdef0",
+  "SubnetId=subnet-0123456789abcdef0",
+  "GcpServiceAccount=cartography-reader@my-cartography.iam.gserviceaccount.com",
+  "GcpWifAudience=//iam.googleapis.com/projects/000000000000/locations/global/workloadIdentityPools/aws-cartography/providers/aws-111111111111",
+  """DefaultSplitsJson='[{"org_id": "123456789012", "name": "example.com"}]'"""
+]

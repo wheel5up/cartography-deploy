@@ -1,0 +1,312 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Cartography - Kandji (Iru) Lambda Loader. One Lambda, one Step Functions
+  state machine (one execution = one invocation), one EventBridge schedule
+  (daily 08:00 UTC). Kandji ingestion (users, devices, installed apps) fits
+  in a single invocation, so there is no orchestrator or splits list. See
+  README.md.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC that Neo4j and the loaders run in.
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Private subnet with outbound internet (NAT), same VPC as Neo4j.
+
+  LambdaMemoryMb:
+    Type: Number
+    Default: 1024
+    Description: >
+      The apps sync holds every install row (devices x apps) in memory
+      before loading. Raise for very large fleets.
+
+  KandjiMinDevicesForCleanup:
+    Type: Number
+    Default: 1
+    Description: >
+      Refuse KandjiDevice cleanup when a run fetches fewer devices than this.
+      Guards against a misconfigured base URI or an empty-but-200 response
+      deleting every device in the graph. Raise to a floor below your real
+      fleet size (e.g. 80% of it) once the first run shows the count.
+
+  KandjiMinUsersForCleanup:
+    Type: Number
+    Default: 1
+    Description: >
+      Refuse KandjiUser cleanup when a run fetches fewer users than this.
+      Same guard as KandjiMinDevicesForCleanup, applied independently.
+      Raise to a floor below the real directory size (e.g. 80% of it).
+
+  KandjiMinAppInstallsForCleanup:
+    Type: Number
+    Default: 1
+    Description: >
+      Refuse KandjiApp/KandjiAppVersion cleanup when a run fetches fewer app
+      installs (device+version rows) than this. Same guard as the user and
+      device thresholds, applied independently.
+
+  ScheduleDefault:
+    Type: String
+    Default: "cron(0 8 * * ? *)"
+    Description: >
+      Seed for /cartography/kandji-lambda/schedule. Each loader has its
+      own default slot so runs don't overlap; keep this before the ontology
+      loader (10:00 UTC).
+
+Resources:
+
+  # ── Networking ─────────────────────────────────────────────────────────
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: cartography-kandji-lambda-loader-sg
+      GroupDescription: Cartography Kandji Lambda loader - outbound only
+      VpcId: !Ref VpcId
+      Tags:
+        - { Key: Name, Value: cartography-kandji-lambda-loader-sg }
+        - { Key: Project, Value: cartography }
+
+  LambdaEgressHttps:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref LambdaSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: 0.0.0.0/0
+      Description: Outbound HTTPS (Kandji API, SSM)
+
+  LambdaEgressNeo4jBolt:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref LambdaSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8443
+      ToPort: 8443
+      DestinationSecurityGroupId: "{{resolve:ssm:/cartography/sg/neo4j}}"
+      Description: Bolt 8443 to Neo4j
+
+  Neo4jIngressFromKandjiLambda:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: "{{resolve:ssm:/cartography/sg/neo4j}}"
+      IpProtocol: tcp
+      FromPort: 8443
+      ToPort: 8443
+      SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      Description: Bolt 8443 from Cartography Kandji Lambda loader
+
+  # ── Lambda ─────────────────────────────────────────────────────────────
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cartography-kandji-lambda-loader-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: ReadNeo4jPassword
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cartography/neo4j/password"
+        - PolicyName: ReadKandjiConfig
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ssm:GetParameters
+                Resource:
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cartography/kandji/token"
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cartography/kandji/base-uri"
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cartography/kandji/tenant-id"
+      Tags:
+        - { Key: Project, Value: cartography }
+
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /cartography/kandji-lambda-loader
+      RetentionInDays: 30
+
+  KandjiLoaderFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: cartography-kandji-lambda-loader
+      Handler: handler.handler
+      Runtime: python3.13
+      Architectures: [x86_64]
+      CodeUri: .
+      MemorySize: !Ref LambdaMemoryMb
+      Timeout: 900
+      Role: !GetAtt LambdaExecutionRole.Arn
+      VpcConfig:
+        SecurityGroupIds: [!Ref LambdaSecurityGroup]
+        SubnetIds: [!Ref SubnetId]
+      LoggingConfig:
+        LogGroup: !Ref LambdaLogGroup
+      Environment:
+        Variables:
+          NEO4J_URI: "bolt://{{resolve:ssm:/cartography/neo4j/private-ip}}:8443"
+          NEO4J_PASSWORD_SSM_PARAM: /cartography/neo4j/password
+          NEO4J_MAX_CONNECTION_LIFETIME: "200"
+          KANDJI_MIN_DEVICES_FOR_CLEANUP: !Ref KandjiMinDevicesForCleanup
+          KANDJI_MIN_USERS_FOR_CLEANUP: !Ref KandjiMinUsersForCleanup
+          KANDJI_MIN_APP_INSTALLS_FOR_CLEANUP: !Ref KandjiMinAppInstallsForCleanup
+          # SSM parameter NAMES only. The handler reads all three at invoke
+          # time, so the stack deploys before they exist and a value change
+          # takes effect on the next run without a redeploy.
+          KANDJI_SSM_PREFIX: /cartography/kandji
+      Tags:
+        Project: cartography
+
+  # ── Step Functions: one execution = one invocation ─────────────────────
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cartography-kandji-lambda-statemachine-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: states.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeLoaderLambda
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt KandjiLoaderFunction.Arn
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: "*"
+      Tags:
+        - { Key: Project, Value: cartography }
+
+  StateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /cartography/scheduler/kandji-lambda
+      RetentionInDays: 30
+
+  # Input: {} or {"update_tag": <int>}. A handler-reported FAILED becomes a
+  # Fail state so the execution is red and the error is in the cause.
+  KandjiSyncStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: cartography-kandji-lambda-sync
+      RoleArn: !GetAtt StateMachineRole.Arn
+      LoggingConfiguration:
+        Level: ERROR
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup: { LogGroupArn: !GetAtt StateMachineLogGroup.Arn }
+      DefinitionSubstitutions:
+        Fn: !GetAtt KandjiLoaderFunction.Arn
+      Definition:
+        QueryLanguage: JSONata
+        StartAt: Invoke
+        States:
+          Invoke:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Arguments:
+              FunctionName: "${Fn}"
+              Payload: "{% $states.input %}"
+            Retry:
+              - ErrorEquals: [Lambda.ServiceException, Lambda.AWSLambdaException, Lambda.SdkClientException, Lambda.TooManyRequestsException]
+                IntervalSeconds: 2
+                MaxAttempts: 2
+                BackoffRate: 2
+            Output: "{% $states.result.Payload %}"
+            Next: Succeeded?
+          Succeeded?:
+            Type: Choice
+            Choices:
+              - Condition: "{% $states.input.status = 'SUCCEEDED' %}"
+                Next: Done
+            Default: SyncFailed
+          Done:
+            Type: Succeed
+          SyncFailed:
+            Type: Fail
+            Error: KandjiSyncFailed
+            Cause: "{% $string($states.input) %}"
+
+  # ── Schedule ───────────────────────────────────────────────────────────
+  ScheduleParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /cartography/kandji-lambda/schedule
+      Type: String
+      Value: !Ref ScheduleDefault
+      Tags: { Project: cartography }
+
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cartography-kandji-lambda-scheduler-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: scheduler.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StartStateMachine
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref KandjiSyncStateMachine
+      Tags:
+        - { Key: Project, Value: cartography }
+
+  # Change State here, not via the CLI (a CLI flip is reverted by sam deploy).
+  KandjiLambdaSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: cartography-kandji-lambda-daily
+      State: ENABLED
+      ScheduleExpression: !Sub "{{resolve:ssm:${ScheduleParameter}}}"
+      ScheduleExpressionTimezone: UTC
+      FlexibleTimeWindow: { Mode: "OFF" }
+      Target:
+        Arn: !Ref KandjiSyncStateMachine
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: "{}"
+
+Outputs:
+  SyncStateMachineArn:
+    Value: !Ref KandjiSyncStateMachine
+  FunctionArn:
+    Value: !GetAtt KandjiLoaderFunction.Arn
+  LambdaLogGroup:
+    Value: !Ref LambdaLogGroup

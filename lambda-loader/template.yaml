@@ -1,0 +1,1127 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Cartography - Lambda Loader.
+  A single Lambda function calls cartography's Python API directly (not the
+  CLI) to sync a caller-supplied list of AWS modules for one account per
+  invocation. The state machine is a thin single-task wrapper around one
+  Lambda invocation — {"account_id","syncs"} in, per-account result out.
+  Account enumeration and per-account fan-out/concurrency are the caller's
+  responsibility, not this state machine's — see README.md.
+
+Parameters:
+  LambdaMemoryMb:
+    Type: Number
+    Default: 1769
+    Description: >
+      1769MB is where Lambda allocates one full vCPU (CPU scales linearly
+      with memory below that). At 512MB (~0.29 vCPU) permission_relationships' Python evaluation ran ~8x
+      slower than a laptop, and several modules were CPU-bound enough to
+      time out at 900s. Peak memory used at 512MB was <=450MB, so the
+      raise is for CPU, not memory. Cost per invocation is roughly flat for
+      CPU-bound work (3.5x the GB-second rate, ~1/3.5 the duration).
+
+  LambdaTimeoutSeconds:
+    Type: Number
+    Default: 900
+    MaxValue: 900
+    Description: >
+      900s (15 min) is Lambda's hard ceiling — cannot be raised. Kept
+      explicit (not left at some lower default) so a test run always gets the
+      Lambda's full available runway. Accounts with many IAM principals can
+      exceed this for `iam` alone — see README.md "`iam` split" and
+      "Account splits".
+
+  CartographyReadOnlyRoleName:
+    Type: String
+    Default: cartography-read-only
+    Description: >
+      Name of the org-wide StackSet role (see ../stackset/) this Lambda
+      assumes in each spoke account.
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC that Neo4j and the loaders run in.
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Private subnet with outbound internet (NAT), same VPC as Neo4j.
+
+  AccountSplitsDefaultJson:
+    Type: String
+    Default: "{}"
+    Description: >
+      Deploy-time seed for the SSM parameter
+      /cartography/lambda-orchestrator/account-splits — a JSON OBJECT keyed
+      by AWS account ID. Empty object means every account runs a single
+      full-DEFAULT_SYNCS call. Format:
+        {
+          "<account_id>": {
+            "splits": [
+              {"include": [...], "exclude": [...]},
+              {"include": [...], "exclude": [...]}
+            ]
+          }
+        }
+      Each account's `splits` array must be a partition of CONTIGUOUS ranges
+      of DEFAULT_SYNCS's existing order (see README.md "Why order matters,
+      and why splitting is safe"), run serially, in array order, against that account —
+      never a concurrent fan-out within one account. Accounts absent from
+      this object, or present with an empty/missing `splits` array, get
+      exactly one call with include:[],exclude:[] (full DEFAULT_SYNCS).
+      Update via `aws ssm put-parameter --overwrite` — no redeploy needed
+      (CloudFormation only seeds this value on stack create).
+
+  ExcludedAccountsDefaultJson:
+    Type: String
+    Default: "[]"
+    Description: >
+      Deploy-time seed for the SSM parameter
+      /cartography/lambda-orchestrator/excluded-accounts — a JSON ARRAY of
+      account IDs to skip entirely (never invoke cartography-lambda-sync for
+      them, regardless of any account-splits entry). Use it for accounts
+      whose sync can't fit in 900s Lambda invocations even when split, e.g.
+      an Inspector delegated-admin account with a very large findings set.
+      Update via `aws ssm put-parameter --overwrite` — no redeploy needed
+      (CloudFormation only seeds this value on stack create).
+
+  MaxConcurrencyDefault:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 40
+    Description: >
+      Deploy-time seed for the SSM parameter
+      /cartography/lambda-orchestrator/max-concurrency — max accounts synced
+      in parallel by the orchestrator's outer SyncAccounts Map (across-
+      account fan-out only; the inner per-account RunSplits Map always stays
+      MaxConcurrency=1 to force serial split execution, see README.md).
+      MaxValue 40 matches Step Functions' Inline Map mode ceiling (up to
+      10,000 requires Distributed Map mode, not used here). Raising this
+      increases concurrent Neo4j writers sharing the same instance — see
+      README.md "SSM parameters" for the DeadlockDetected/EntityNotFound
+      failure mode this can trigger. The fork's resourcegroupstaggingapi
+      retry wrapper is what makes concurrency above the default of 3
+      survivable.
+      Update via `aws ssm put-parameter --overwrite` — no redeploy needed
+      (CloudFormation only seeds this value on stack create), matching
+      account-splits/excluded-accounts above.
+
+Resources:
+
+  # ── Security group ─────────────────────────────────────────────────────
+  # Egress: HTTPS out for AWS API calls via the existing NAT gateway, Bolt
+  # 8443 to the Neo4j SG.
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: cartography-lambda-loader-sg
+      GroupDescription: Cartography Lambda loader - outbound only
+      VpcId: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value: cartography-lambda-loader-sg
+        - Key: Project
+          Value: cartography
+
+  LambdaEgressHttps:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref LambdaSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: 0.0.0.0/0
+      Description: Outbound HTTPS (AWS APIs, STS assume-role)
+
+  LambdaEgressNeo4jBolt:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref LambdaSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8443
+      ToPort: 8443
+      DestinationSecurityGroupId: "{{resolve:ssm:/cartography/sg/neo4j}}"
+      Description: Bolt 8443 to Neo4j
+
+  # Allow the Lambda's ENI in on cartography-neo4j-sg (see
+  # network/template.yaml) with its own explicit ingress rule.
+  Neo4jIngressFromLambda:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: "{{resolve:ssm:/cartography/sg/neo4j}}"
+      IpProtocol: tcp
+      FromPort: 8443
+      ToPort: 8443
+      SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      Description: Bolt 8443 from Cartography Lambda loader
+
+  # ── IAM role for the Lambda function ──────────────────────────────────
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cartography-lambda-loader-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # Needed because the Lambda scans the hub account (the account it
+        # runs in) directly with its own execution role.
+        - arn:aws:iam::aws:policy/SecurityAudit
+        # Required for a Lambda attached to a VPC to create/manage its ENIs.
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: ReadNeo4jPassword
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cartography/neo4j/password"
+        - PolicyName: AssumeCartographyReadOnlyRole
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: sts:AssumeRole
+                Resource: !Sub "arn:aws:iam::*:role/${CartographyReadOnlyRoleName}"
+        - PolicyName: DescribeRegions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ec2:DescribeRegions
+                Resource: "*"
+        # Resolves the account's real friendly name (see
+        # handler._lookup_account_name) so a Lambda-driven sync doesn't
+        # clobber the name organizations.sync() wrote with the raw account
+        # ID. Callable from the hub account's own execution role, no
+        # assume-role needed (organizations:DescribeAccount is org-wide from
+        # any account with this permission, same as ListAccounts).
+        - PolicyName: DescribeAccountName
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: organizations:DescribeAccount
+                Resource: "*"
+        # Same extras as the org-wide cartography-read-only role
+        # (../stackset/template.yaml CartographyReadExtras): the hub account
+        # is synced with THIS role directly, not via assume-role, so it needs
+        # its own copy. SecurityAudit does not grant either action; cartography uses
+        # them to link container Lambdas to images and ECR images to repos.
+        - PolicyName: CartographyReadExtras
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:GetFunction
+                  - codebuild:BatchGetBuilds
+                Resource: "*"
+      Tags:
+        - Key: Project
+          Value: cartography
+
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /cartography/lambda-loader
+      RetentionInDays: 30
+
+  # ── The Lambda function ───────────────────────────────────────────────
+  CartographyLoaderFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: cartography-lambda-loader
+      Handler: handler.handler
+      Runtime: python3.13
+      Architectures: [x86_64]
+      CodeUri: .
+      MemorySize: !Ref LambdaMemoryMb
+      Timeout: !Ref LambdaTimeoutSeconds
+      Role: !GetAtt LambdaExecutionRole.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref SubnetId
+      LoggingConfig:
+        LogGroup: !Ref LambdaLogGroup
+      Environment:
+        Variables:
+          NEO4J_URI: "bolt://{{resolve:ssm:/cartography/neo4j/private-ip}}:8443"
+          NEO4J_PASSWORD_SSM_PARAM: /cartography/neo4j/password
+          NEO4J_MAX_CONNECTION_LIFETIME: "200"
+          AWS_HOME_REGION: !Ref AWS::Region
+          ASSUME_ROLE_DURATION_SECONDS: "3600"
+          # Threads for the `iam:service_access` phase's AWS IAM Access
+          # Advisor polling loop (see handler._iam_service_access_sync).
+          # 2 workers took ~685s (11.4 min) on an account with ~550
+          # principals — see README.md "`iam` split". 4 leaves more headroom,
+          # e.g. to run `iam` core + `iam:service_access` in one invocation.
+          IAM_SERVICE_ACCESS_MAX_WORKERS: "4"
+      Tags:
+        Project: cartography
+
+  # ── IAM role for Step Functions ───────────────────────────────────────
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cartography-lambda-statemachine-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeLoaderLambda
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt CartographyLoaderFunction.Arn
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: "*"
+      Tags:
+        - Key: Project
+          Value: cartography
+
+  StateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /cartography/scheduler/lambda-loader
+      RetentionInDays: 30
+
+  # ── Step Functions state machine ──────────────────────────────────────
+  # No EventBridge schedule on this stack — the daily run is driven by
+  # ../lambda-orchestrator-schedule/. See README.md "Build, deploy and
+  # test" for the start-execution commands.
+  #
+  # Single-account, single-task wrapper. One execution = one account:
+  #   {"account_id": "123456789012", "include": ["iam"], "exclude": []}
+  #   {"account_id": "123456789012", "include": [], "exclude": ["iam"]}
+  # Exactly one of include/exclude may be non-empty (ValidateInput fails the
+  # execution fast if both are populated). Both empty/omitted runs the
+  # handler's DEFAULT_SYNCS.
+  #
+  # Account enumeration (listing all org accounts) and fan-out/concurrency
+  # (running many accounts in parallel) are NOT this state machine's job —
+  # the caller starts one execution per account, at whatever concurrency it
+  # chooses (e.g. the orchestrator below).
+  CartographyLambdaStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: cartography-lambda-sync
+      RoleArn: !GetAtt StateMachineRole.Arn
+      LoggingConfiguration:
+        Level: ERROR
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StateMachineLogGroup.Arn
+      DefinitionSubstitutions:
+        LoaderFunctionArn: !GetAtt CartographyLoaderFunction.Arn
+        CartographyReadOnlyRoleName: !Ref CartographyReadOnlyRoleName
+        HubAccountId: !Ref AWS::AccountId
+      Definition:
+        QueryLanguage: JSONata
+        Comment: >
+          Single-account, single-task wrapper around the cartography Lambda
+          loader. Input: {"account_id": "<id>", "include": [...], "exclude": [...]}.
+          Exactly one of include/exclude may be non-empty — see
+          ValidateInput. Account enumeration and per-account fan-out/
+          concurrency are the caller's responsibility (not this state
+          machine's) — see cartography-lambda-orchestrator.
+        StartAt: ValidateInput
+        States:
+
+          # Fails fast, before ever invoking the Lambda, if the caller
+          # populated both include and exclude — ambiguous by design (see
+          # handler.py _resolve_requested_syncs, which documents the
+          # same-effect precedence if this check is ever bypassed via a
+          # direct Lambda invoke instead of through this state machine).
+          ValidateInput:
+            Type: Choice
+            Choices:
+              - Condition: "{% $count($states.input.include ? $states.input.include : []) > 0 and $count($states.input.exclude ? $states.input.exclude : []) > 0 %}"
+                Next: InvalidInput
+            Default: InvokeLoader
+
+          InvalidInput:
+            Type: Fail
+            Error: AmbiguousIncludeExclude
+            Cause: >
+              Both "include" and "exclude" were non-empty in the input.
+              Exactly one may be populated — pass the other as [] or omit it.
+
+          InvokeLoader:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Arguments:
+              FunctionName: "${LoaderFunctionArn}"
+              Payload:
+                account_id: "{% $states.input.account_id %}"
+                include: "{% $states.input.include ? $states.input.include : [] %}"
+                exclude: "{% $states.input.exclude ? $states.input.exclude : [] %}"
+                # Hub account uses the Lambda's own execution role
+                # (SecurityAudit) directly — no assume-role. Every other
+                # account assumes cartography-read-only (see
+                # ../stackset/). Kept here (not
+                # pushed to the caller) since it's a static, local
+                # transformation with no orchestration concerns — see
+                # README.md for the reasoning.
+                role_arn: "{% $states.input.account_id = \"${HubAccountId}\" ? null : 'arn:aws:iam::' & $states.input.account_id & ':role/${CartographyReadOnlyRoleName}' %}"
+            # Retry ONLY on Lambda-service-level failures (throttling,
+            # transient invoke errors) — NOT on the handler's own reported
+            # failure (which surfaces as a 200 response body with
+            # status:"FAILED", not a Lambda error), so a slow/timed-out
+            # account is not silently retried and does not multiply its
+            # already-long runtime.
+            Retry:
+              - ErrorEquals:
+                  - Lambda.ServiceException
+                  - Lambda.AWSLambdaException
+                  - Lambda.SdkClientException
+                  - Lambda.TooManyRequestsException
+                IntervalSeconds: 2
+                MaxAttempts: 3
+                BackoffRate: 2
+            Catch:
+              - ErrorEquals: ["States.ALL"]
+                Next: AccountSyncFailed
+                # A Catch transition bypasses this Task's own `Assign` below
+                # entirely (a Lambda timeout goes straight to the Catch).
+                # Previously this had to
+                # re-derive `accountId` here too, because the old
+                # AccountSyncFailed (a Pass state) referenced it. Now that
+                # AccountSyncFailed is a Fail state, it needs no variables
+                # at all — account_id is already visible on the execution's
+                # own input via DescribeExecution — so only the error detail
+                # is captured here.
+                Assign:
+                  catchError: "{% $states.errorOutput %}"
+            Assign:
+              accountId: "{% $states.input.account_id %}"
+              invokeResult: "{% $states.result.Payload %}"
+            Output: {}
+            Next: EvalInvokeResult
+
+          EvalInvokeResult:
+            Type: Choice
+            Choices:
+              - Condition: "{% $invokeResult.status = 'SUCCEEDED' %}"
+                Next: AccountSyncComplete
+            Default: AccountSyncFailed
+
+          AccountSyncComplete:
+            Type: Pass
+            Output:
+              accountId: "{% $accountId %}"
+              status: SUCCEEDED
+              durationSeconds: "{% $invokeResult.durationSeconds %}"
+              regions: "{% $invokeResult.regions %}"
+            End: true
+
+          # A genuine Fail state — NOT a Pass. This state machine has no Map
+          # (single-account, single-task; see the header Comment), so there
+          # is no "keep going for the other items" concern a Pass state
+          # would protect. A Fail state ends the execution with AWS-level
+          # status FAILED, which makes CloudWatch's ExecutionsFailed metric,
+          # EventBridge "Step Functions Execution Status Change" rules, and
+          # the Step Functions console's red X work without any extra
+          # plumbing. A Pass state here can hide a total outage (parent
+          # execution reports SUCCEEDED while every account failed).
+          #
+          # account_id remains visible without any variable — it is part of
+          # the execution's own *input*, which DescribeExecution/the console
+          # always show regardless of execution status. `Cause` must be a
+          # string (ASL requirement) — the handler-reported error
+          # ($invokeResult.error) already is one, but $catchError is
+          # $states.errorOutput, an OBJECT ({Error, Cause, ...}), so it's
+          # stringified via JSONata's built-in $string() (this state machine
+          # uses QueryLanguage: JSONata — the States.* intrinsic functions
+          # referenced in some AWS docs are JSONPath-only and don't apply here).
+          AccountSyncFailed:
+            Type: Fail
+            Error: AccountSyncFailed
+            Cause: "{% $exists($invokeResult) ? $invokeResult.error : $string($catchError) %}"
+
+  # ── Runtime-adjustable account→splits table (SSM) ─────────────────────
+  # A JSON OBJECT keyed by account ID (NOT an array) so the orchestrator can
+  # do an O(1) $lookup() by account ID in JSONata, matching how the account
+  # ID is used as a lookup key rather than a filter predicate. Empty object
+  # ({}) means "every account gets one full-DEFAULT_SYNCS call" — see
+  # AccountSplitsDefaultJson's Description above for the full shape and the
+  # contiguous-range constraint on each account's `splits` array.
+  # NOTE: CloudFormation only sets this value on stack *create*; a later
+  # `sam deploy` will NOT overwrite an out-of-band edit. This is intentional
+  # so operators can add/edit an account's splits via
+  #   aws ssm put-parameter --overwrite \
+  #     --name /cartography/lambda-orchestrator/account-splits --value '{...}'
+  # without losing the change on the next deploy.
+  AccountSplitsParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /cartography/lambda-orchestrator/account-splits
+      Type: String
+      Tier: Advanced
+      Value: !Ref AccountSplitsDefaultJson
+      Description: >
+        JSON object keyed by AWS account ID, each value {"splits": [{"include":
+        [...], "exclude": [...]}, ...]}. Read at runtime by
+        cartography-lambda-orchestrator. Accounts absent, or present with an
+        empty/missing splits array, get one full-DEFAULT_SYNCS call.
+        Advanced tier (not Standard): with 20+ accounts needing explicit
+        per-module include/exclude lists, the JSON payload exceeds Standard
+        tier's 4096-char limit (~6.5KB with ~20 accounts configured). Advanced tier supports up to 8KB for ~$0.05/month.
+      Tags:
+        Project: cartography
+
+  # ── Runtime-adjustable excluded-accounts list (SSM) ───────────────────
+  # A JSON ARRAY of account IDs the orchestrator skips entirely — no
+  # cartography-lambda-sync invocation at all, regardless of any
+  # account-splits entry for that account. Distinct from account-splits:
+  # a split-array entry still SYNCS the account (just across multiple calls);
+  # this list means DO NOT SYNC via this orchestrator, full stop. Same
+  # no-redeploy-needed update pattern as AccountSplitsParameter:
+  #   aws ssm put-parameter --overwrite \
+  #     --name /cartography/lambda-orchestrator/excluded-accounts \
+  #     --value '["111111111111"]'
+  ExcludedAccountsParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /cartography/lambda-orchestrator/excluded-accounts
+      Type: String
+      Value: !Ref ExcludedAccountsDefaultJson
+      Description: >
+        JSON array of account IDs to skip entirely. Read at runtime by
+        cartography-lambda-orchestrator (see ExcludedAccountsDefaultJson's
+        Description).
+      Tags:
+        Project: cartography
+
+  # ── Runtime-adjustable outer-Map concurrency (SSM) ────────────────────
+  # Read once per orchestrator execution (GetMaxConcurrency state) so it can
+  # be changed via `aws ssm put-parameter --overwrite` without a redeploy —
+  # same pattern as account-splits/excluded-accounts above. Originally a
+  # CloudFormation Parameter baked into the state machine definition at
+  # deploy time; converted to this SSM parameter so a concurrency change
+  # (e.g. raising from 3 to 10 to speed up a full-org run) doesn't require
+  # a full sam build/deploy cycle.
+  MaxConcurrencyParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /cartography/lambda-orchestrator/max-concurrency
+      Type: String
+      Value: !Ref MaxConcurrencyDefault
+      Description: >
+        Max accounts synced in parallel by the orchestrator's outer
+        SyncAccounts Map. Read at runtime by cartography-lambda-orchestrator.
+        See MaxConcurrencyDefault's Description for the Neo4j-concurrency
+        tradeoff of raising this.
+      Tags:
+        Project: cartography
+
+  # ── IAM role for the orchestrator state machine ───────────────────────
+  OrchestratorStateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cartography-lambda-orchestrator-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ListOrgAccounts
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: organizations:ListAccounts
+                Resource: "*"
+        - PolicyName: ReadOrchestratorParameters
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource:
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cartography/lambda-orchestrator/account-splits"
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cartography/lambda-orchestrator/excluded-accounts"
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cartography/lambda-orchestrator/max-concurrency"
+        # Nested-workflow permissions for the SYNCHRONOUS startExecution.sync:2
+        # integration (see README.md / AWS docs "Configuring IAM permissions
+        # for nested state machines"). states:StartExecution needs the STATE
+        # MACHINE arn; DescribeExecution/StopExecution need the EXECUTION arn
+        # (note the different resource shape — arn:...:execution:<name>:* not
+        # arn:...:stateMachine:<name>). The events:* triple lets Step
+        # Functions use EventBridge (instead of pure polling) to learn when
+        # the nested execution completes, per the same AWS doc.
+        - PolicyName: InvokeLambdaSyncStateMachine
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref CartographyLambdaStateMachine
+              - Effect: Allow
+                Action:
+                  - states:DescribeExecution
+                  - states:StopExecution
+                Resource: !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:cartography-lambda-sync:*"
+              - Effect: Allow
+                Action:
+                  - events:PutTargets
+                  - events:PutRule
+                  - events:DescribeRule
+                Resource: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsForStepFunctionsExecutionRule"
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: "*"
+      Tags:
+        - Key: Project
+          Value: cartography
+
+  OrchestratorStateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /cartography/scheduler/lambda-orchestrator
+      RetentionInDays: 30
+
+  # ── Orchestrator state machine ────────────────────────────────────────
+  # No EventBridge schedule here — triggered daily by
+  # ../lambda-orchestrator-schedule/. Enumerates every ACTIVE org account, drops
+  # any account on the excluded-accounts list entirely, looks up each
+  # remaining account's split configuration (defaults to one full-
+  # DEFAULT_SYNCS call when absent), and drives cartography-lambda-sync
+  # accordingly:
+  #
+  #   ListAccounts (paginated, ACTIVE only)
+  #     -> GetExcludedAccounts (SSM GetParameter + $parse)
+  #     -> FilterExcludedAccounts (drop excluded accounts from $accounts —
+  #          these get ZERO cartography-lambda-sync invocations, not "one
+  #          call that runs everything" the way an account merely absent
+  #          from account-splits would; see excluded-accounts vs.
+  #          account-splits distinction in ExcludedAccountsDefaultJson's
+  #          Description. Typically the Inspector delegated-admin account,
+  #          whose Inspector phase alone runs ~3h44m+, far beyond what a
+  #          900s Lambda can checkpoint around)
+  #     -> GetAccountSplits (SSM GetParameter + $parse)
+  #     -> SyncAccounts (outer Map, MaxConcurrency=3 — across accounts)
+  #          -> per account:
+  #               resolve splits: $lookup($splitsTable, accountId).splits
+  #                 ?? [{"include":[],"exclude":[]}]
+  #               -> RunSplits (inner Map, MaxConcurrency=1 — FORCES SERIAL
+  #                    execution within one account, since split chunks are
+  #                    contiguous ranges of DEFAULT_SYNCS and must run in
+  #                    order — see README.md "Why order matters, and
+  #                    why splitting is safe")
+  #                    -> per split: states:startExecution.sync:2 on
+  #                       cartography-lambda-sync, waits for it to finish
+  #                       before the next split in the same account starts.
+  #
+  # Input options:
+  #   {}                                      — full org (default)
+  #   {"accounts": ["<id1>", "<id2>", ...]}    — exactly that list, skips
+  #                                               ListAccounts / pagination
+  #                                               entirely
+  #   {"include": ["<module>", ...], "exclude": [...], "concurrency": N}
+  #                                           — SYNC-OVERRIDE MODE. Every
+  #     in-scope account (full org, or the explicit "accounts" list above —
+  #     composable with it) gets exactly ONE cartography-lambda-sync
+  #     invocation with this include/exclude, completely bypassing the
+  #     /cartography/lambda-orchestrator/account-splits lookup — no
+  #     per-account chunking, no $lookup, full stop. Built specifically to
+  #     run "resourcegroupstaggingapi" (or any other single module) across
+  #     the org at a deliberately LOW concurrency, separately from the main
+  #     per-account fan-out, to avoid the AWSTag MERGE lock contention
+  #     documented in README.md. "concurrency" (plain number, not a string)
+  #     overrides /cartography/lambda-orchestrator/max-concurrency for THIS
+  #     execution only — the SSM parameter itself is untouched. Exactly one
+  #     of include/exclude may be non-empty (same ambiguity rule as
+  #     cartography-lambda-sync; see CheckSyncOverrideInput below).
+  #     FilterExcludedAccounts still applies — an override does NOT exempt
+  #     any excluded-accounts entry. NOT a replacement for
+  #     account-splits' per-account timeout chunking — if the requested
+  #     module doesn't fit in 900s for some account in isolation, that
+  #     account's single invocation just fails, same as any other timeout.
+  #     Deliberately does not attempt to reconcile with an account's
+  #     existing account-splits entry — too complicated (whose chunking
+  #     would "win"?); the override simply ignores account-splits entirely.
+  #     To find out ahead of time whether a module fits in 900s for a given
+  #     account, test it directly: {"accounts": ["<id>"],
+  #     "include": ["<module>"], "concurrency": 1}.
+  # Either way, FilterExcludedAccounts and the per-account splits lookup
+  # still apply — an explicit account list is NOT exempt from the
+  # excluded-accounts SSM parameter.
+  CartographyOrchestratorStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: cartography-lambda-orchestrator
+      RoleArn: !GetAtt OrchestratorStateMachineRole.Arn
+      LoggingConfiguration:
+        Level: ERROR
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt OrchestratorStateMachineLogGroup.Arn
+      DefinitionSubstitutions:
+        LambdaSyncStateMachineArn: !Ref CartographyLambdaStateMachine
+      Definition:
+        QueryLanguage: JSONata
+        Comment: >
+          Enumerates every ACTIVE AWS org account (or, if given {"accounts":
+          [...]}, exactly that explicit list instead), skips any account
+          listed in /cartography/lambda-orchestrator/excluded-accounts
+          entirely, and drives cartography-lambda-sync once per remaining
+          account (or once per configured split, run serially, for accounts
+          with a /cartography/lambda-orchestrator/account-splits entry). See
+          README.md for the full design.
+        StartAt: CheckSyncOverrideInput
+        States:
+
+          # Sync-override mode validation — fails fast, before touching
+          # ListAccounts/SSM/anything, if the caller populated both include
+          # and exclude. Mirrors cartography-lambda-sync's own ValidateInput
+          # (ambiguous by design — see that state machine's comment).
+          # Sets $syncOverride (the one split every account will use
+          # verbatim) and $concurrencyOverride only when include/exclude was
+          # actually provided; otherwise both stay unset and the rest of the
+          # flow behaves exactly as it did before this change.
+          CheckSyncOverrideInput:
+            Type: Choice
+            Choices:
+              - Condition: "{% $count($states.input.include ? $states.input.include : []) > 0 and $count($states.input.exclude ? $states.input.exclude : []) > 0 %}"
+                Next: InvalidSyncOverrideInput
+              - Condition: "{% $exists($states.input.include) or $exists($states.input.exclude) %}"
+                Assign:
+                  syncOverride: "{% { \"include\": $states.input.include ? $states.input.include : [], \"exclude\": $states.input.exclude ? $states.input.exclude : [] } %}"
+                  concurrencyOverride: "{% $states.input.concurrency ? $number($states.input.concurrency) : null %}"
+                Next: CheckInputAccounts
+            Default: CheckInputAccounts
+
+          InvalidSyncOverrideInput:
+            Type: Fail
+            Error: AmbiguousSyncOverrideIncludeExclude
+            Cause: >
+              Both "include" and "exclude" were non-empty in the top-level
+              sync-override input. Exactly one may be populated — pass the
+              other as [] or omit it.
+
+          # Manual-invoke override: pass {"accounts": ["<id>", ...]} to run
+          # against exactly that list instead of discovering the full org.
+          # Skips ListAccounts (and its pagination) entirely. Still passes through FilterExcludedAccounts
+          # and the per-account splits lookup below, same as a full-org run.
+          # Omit "accounts", or pass {} / {"accounts":[]}, for the default
+          # full-org behavior.
+          CheckInputAccounts:
+            Type: Choice
+            Choices:
+              - Condition: "{% $count($states.input.accounts ? $states.input.accounts : []) > 0 %}"
+                Assign:
+                  accounts: "{% $append([], $states.input.accounts) %}"
+                Next: GetExcludedAccounts
+            Default: ListAccounts
+
+          ListAccounts:
+            Type: Task
+            Resource: arn:aws:states:::aws-sdk:organizations:listAccounts
+            Arguments: {}
+            Assign:
+              accounts: "{% $append($accounts ? $accounts : [], $states.result.Accounts[Status = 'ACTIVE'].Id) %}"
+              listAccountsNextToken: "{% $states.result.NextToken %}"
+            Output: {}
+            Next: CheckListAccountsPage
+
+          CheckListAccountsPage:
+            Type: Choice
+            Choices:
+              - Condition: "{% $exists($listAccountsNextToken) and $listAccountsNextToken != null %}"
+                Next: ListAccountsNextPage
+            Default: GetExcludedAccounts
+
+          ListAccountsNextPage:
+            Type: Task
+            Resource: arn:aws:states:::aws-sdk:organizations:listAccounts
+            Arguments:
+              NextToken: "{% $listAccountsNextToken %}"
+            Assign:
+              accounts: "{% $append($accounts, $states.result.Accounts[Status = 'ACTIVE'].Id) %}"
+              listAccountsNextToken: "{% $exists($states.result.NextToken) ? $states.result.NextToken : null %}"
+            Output: {}
+            Next: CheckListAccountsPage
+
+          # Read the excluded-accounts list from SSM and filter it out of
+          # $accounts BEFORE the splits lookup / Map even sees those accounts
+          # — an excluded account gets ZERO cartography-lambda-sync
+          # invocations, not "one call that happens to run everything" the
+          # way an account absent from account-splits would. No fallback if
+          # the parameter is missing/unreadable: fail loudly, by design
+          # — the stack resource seeds this on create, so a missing param
+          # means someone deleted it out of band.
+          GetExcludedAccounts:
+            Type: Task
+            Resource: arn:aws:states:::aws-sdk:ssm:getParameter
+            Arguments:
+              Name: /cartography/lambda-orchestrator/excluded-accounts
+            Assign:
+              excludedAccounts: "{% $parse($states.result.Parameter.Value) %}"
+            Output: {}
+            Next: FilterExcludedAccounts
+
+          # $append([], ...) forces the result to stay an array even when
+          # filtering leaves exactly one account (JSONata's "singleton array
+          # and value equivalence" rule otherwise collapses a one-element
+          # array to a bare scalar) or zero accounts (a plain predicate with
+          # no matches returns `undefined`, not `[]`). Either case would break
+          # the downstream Map state's `Items` field, which requires an
+          # array. Checked with the jsonata npm package (2.0.x) — see
+          # README.md "JSONata: filters that match one item return a
+          # scalar". SummarizeResults.failedAccounts
+          # below uses the same fix.
+          FilterExcludedAccounts:
+            Type: Pass
+            Assign:
+              accounts: |-
+                {%
+                  $append(
+                    [],
+                    $accounts[$not($ in $excludedAccounts)]
+                  )
+                %}
+            Output: {}
+            Next: GetAccountSplits
+
+          # Read the account->splits table from SSM. No fallback if the
+          # parameter is missing/unreadable: fail loudly, by design — the
+          # stack resource seeds this on create, so a missing param means
+          # someone deleted it out of band.
+          #
+          # SKIPPED ENTIRELY in sync-override mode ($syncOverride set) —
+          # there is nothing to look up; every account gets $syncOverride
+          # verbatim (see SyncAccounts's ItemSelector below). Avoids an
+          # unneeded SSM call in override mode.
+          GetAccountSplits:
+            Type: Choice
+            Choices:
+              - Condition: "{% $exists($syncOverride) %}"
+                Next: GetMaxConcurrency
+            Default: GetAccountSplitsFromSsm
+
+          GetAccountSplitsFromSsm:
+            Type: Task
+            Resource: arn:aws:states:::aws-sdk:ssm:getParameter
+            Arguments:
+              Name: /cartography/lambda-orchestrator/account-splits
+            Assign:
+              splitsTable: "{% $parse($states.result.Parameter.Value) %}"
+            Output: {}
+            Next: GetMaxConcurrency
+
+          # Read the outer-Map concurrency from SSM at execution time, same
+          # no-fallback-if-missing rationale as GetAccountSplits above.
+          # $number(...) converts the SSM String parameter's text value
+          # (e.g. "10") to an actual JSONata number, since MaxConcurrency
+          # below requires a numeric JSONata expression, not a string.
+          #
+          # $concurrencyOverride (set by CheckSyncOverrideInput only when the
+          # caller passed "concurrency") wins over the SSM value for THIS
+          # execution only — the parameter itself is never written to.
+          GetMaxConcurrency:
+            Type: Task
+            Resource: arn:aws:states:::aws-sdk:ssm:getParameter
+            Arguments:
+              Name: /cartography/lambda-orchestrator/max-concurrency
+            Assign:
+              maxConcurrency: "{% $exists($concurrencyOverride) ? $concurrencyOverride : $number($states.result.Parameter.Value) %}"
+            Output: {}
+            Next: SyncAccounts
+
+          # Outer Map: one iteration per account, fanned out up to
+          # $maxConcurrency (read from SSM by GetMaxConcurrency above; all
+          # accounts share one Neo4j instance, so mind write concurrency).
+          # A failed account/split does NOT abort the Map — routes to
+          # AccountSyncFailed (Pass), so the Map always completes for every
+          # account. Change via
+          # `aws ssm put-parameter --overwrite` — no redeploy needed.
+          SyncAccounts:
+            Type: Map
+            Items: "{% $accounts %}"
+            ItemSelector:
+              accountId: "{% $states.context.Map.Item.Value %}"
+              # SYNC-OVERRIDE MODE ($syncOverride set): every account gets
+              # exactly $syncOverride as its one-and-only split — no
+              # account-splits lookup at all. Otherwise, unchanged: $lookup
+              # on an OBJECT keyed by account ID — O(1), not a filter over
+              # an array. Falls back to a single full-DEFAULT_SYNCS split
+              # ONLY when the account is absent, has no `splits` key, or
+              # `splits` is present but empty ($exists()+$count() check
+              # covers all three — no special-casing
+              # "missing account" vs "empty splits array", one code path).
+              splits: |-
+                {%
+                  $exists($syncOverride)
+                    ? [$syncOverride]
+                    : ( $accountSplits := $lookup($splitsTable, $states.context.Map.Item.Value).splits;
+                        ($exists($accountSplits) and $count($accountSplits) > 0)
+                          ? $accountSplits
+                          : [{"include": [], "exclude": []}]
+                      )
+                %}
+            MaxConcurrency: "{% $maxConcurrency %}"
+            ItemProcessor:
+              ProcessorConfig:
+                Mode: INLINE
+              StartAt: RunSplits
+              States:
+                # Inner Map: one iteration per split for THIS account.
+                # MaxConcurrency=1 forces strictly serial execution — splits
+                # are contiguous ranges of DEFAULT_SYNCS and must run in
+                # array order for inter-module edges to form correctly (see
+                # README.md). This is a Map state (not a hand-rolled loop)
+                # per design, just concurrency-capped to guarantee order.
+                RunSplits:
+                  Type: Map
+                  Items: "{% $states.input.splits %}"
+                  ItemSelector:
+                    accountId: "{% $states.input.accountId %}"
+                    splitIndex: "{% $states.context.Map.Item.Index %}"
+                    include: "{% $states.context.Map.Item.Value.include ? $states.context.Map.Item.Value.include : [] %}"
+                    exclude: "{% $states.context.Map.Item.Value.exclude ? $states.context.Map.Item.Value.exclude : [] %}"
+                  MaxConcurrency: 1
+                  ItemProcessor:
+                    ProcessorConfig:
+                      Mode: INLINE
+                    StartAt: RunSplit
+                    States:
+                      # Synchronous nested execution (startExecution.sync:2 —
+                      # the ":2" suffix returns JSON Output, not a
+                      # string-escaped blob — see AWS docs "Start a new AWS
+                      # Step Functions state machine from a running
+                      # execution"). This call BLOCKS until
+                      # cartography-lambda-sync's execution finishes, which
+                      # is what makes the inner Map serial in practice (on
+                      # top of MaxConcurrency=1 belt-and-suspenders).
+                      # Reuses cartography-lambda-sync's own hub/spoke role
+                      # resolution, Retry (Lambda service errors only), and
+                      # Fail-state behavior — nothing about that logic is
+                      # duplicated here.
+                      RunSplit:
+                        Type: Task
+                        Resource: arn:aws:states:::states:startExecution.sync:2
+                        Arguments:
+                          StateMachineArn: "${LambdaSyncStateMachineArn}"
+                          # Execution name must be unique per invocation (Step
+                          # Functions rejects a duplicate name on the same
+                          # state machine within its execution-history
+                          # retention window). accountId + splitIndex alone
+                          # would collide on a re-run of this orchestrator, so
+                          # $millis() (current epoch ms) is appended.
+                          #
+                          # $states.context here refers to the ORCHESTRATOR's
+                          # own execution context, not the nested
+                          # cartography-lambda-sync execution's — this Task
+                          # (states:startExecution.sync:2) runs AS a state of
+                          # the orchestrator's own state machine, so
+                          # $states.context.Execution.Name is the
+                          # orchestrator's run ID (either Step Functions'
+                          # auto-generated UUID, or whatever name was passed to
+                          # start-execution). Only the first hyphen-delimited
+                          # segment is used ($split(...)[0]) — the full UUID
+                          # made execution names too long to scan at a
+                          # glance in the console; the first 8 chars are
+                          # enough to group every child of one orchestrator
+                          # run together and distinguish it from another run's
+                          # children (e.g. "orch-2bb95bb8-..." vs
+                          # "orch-6f0af0f2-..."). If Execution.Name has no
+                          # hyphens (e.g. a custom name passed without any),
+                          # $split(...)[0] just returns the whole name.
+                          Name: |-
+                            {%
+                              "orch-"
+                              & $split($states.context.Execution.Name, "-")[0]
+                              & "-"
+                              & $states.input.accountId
+                              & "-"
+                              & $string($states.input.splitIndex)
+                              & "-"
+                              & $string($millis())
+                            %}
+                          Input:
+                            account_id: "{% $states.input.accountId %}"
+                            include: "{% $states.input.include %}"
+                            exclude: "{% $states.input.exclude %}"
+                        Retry:
+                          - ErrorEquals:
+                              - StepFunctions.ExecutionLimitExceeded
+                            IntervalSeconds: 5
+                            MaxAttempts: 3
+                            BackoffRate: 2
+                        Catch:
+                          - ErrorEquals: ["States.ALL"]
+                            Next: SplitFailed
+                            Assign:
+                              accountId: "{% $states.input.accountId %}"
+                              splitIndex: "{% $states.input.splitIndex %}"
+                              catchError: "{% $states.errorOutput %}"
+                        Assign:
+                          accountId: "{% $states.input.accountId %}"
+                          splitIndex: "{% $states.input.splitIndex %}"
+                          # startExecution.sync:2's Output is the nested
+                          # execution's own Output — i.e. cartography-lambda-
+                          # sync's AccountSyncComplete Pass-state payload
+                          # ({accountId, status, durationSeconds, regions}).
+                          # A nested FAILURE (the child's own AccountSyncFailed
+                          # Fail state) surfaces HERE as a Catch on this Task,
+                          # not as a successful result with status:"FAILED" —
+                          # see README.md "`cartography-lambda-sync`":
+                          # AccountSyncFailed being a Fail state is exactly
+                          # what makes this distinction possible.
+                          splitResult: "{% $states.result.Output %}"
+                        Output: {}
+                        Next: SplitComplete
+                      SplitComplete:
+                        Type: Pass
+                        Output:
+                          accountId: "{% $accountId %}"
+                          splitIndex: "{% $splitIndex %}"
+                          status: SUCCEEDED
+                          durationSeconds: "{% $splitResult.durationSeconds %}"
+                        End: true
+                      SplitFailed:
+                        Type: Pass
+                        Output:
+                          accountId: "{% $accountId %}"
+                          splitIndex: "{% $splitIndex %}"
+                          status: FAILED
+                          error: "{% $string($catchError) %}"
+                        End: true
+                  # Both variables assigned here, in ONE Assign block — ASL
+                  # does not support multiple Assign fields on a single state
+                  # (a second Assign key would just silently clobber the
+                  # first in the YAML/JSON, never even reaching Step
+                  # Functions as two separate assignments).
+                  #
+                  # outerAccountId: captured HERE (not on a separate Assign
+                  # above ItemProcessor) because this is the one and only
+                  # Assign point for this state. $states.input at this state
+                  # still refers to RunSplits's OWN input — the outer Map's
+                  # ItemSelector payload {accountId, splits} — since Assign
+                  # evaluates against pre-Output values. Needed downstream by
+                  # AccountSyncComplete, which runs AFTER this state's own
+                  # Output: {} has emptied $states.input for it. Named
+                  # outerAccountId, NOT accountId, because RunSplit's Assign
+                  # (inside THIS Map's own ItemProcessor, below) already
+                  # assigns a same-named "accountId" in a genuinely different,
+                  # INNER scope — Step Functions rejects a variable name
+                  # reused between an outer and inner scope at state-machine
+                  # validation time ("a variable assigned in an inner scope
+                  # cannot have the same name as one assigned in an outer
+                  # scope" — AWS docs "Passing data between states with
+                  # variables"). Without it, AccountSyncComplete's
+                  # $states.input.accountId returns undefined and fails with
+                  # States.QueryEvaluationError, even though the underlying
+                  # cartography-lambda-sync invocation already SUCCEEDED —
+                  # an orchestrator-side bug, not a sync failure.
+                  #
+                  # splitResults: this Map's own result array (per-split
+                  # {accountId, splitIndex, status, ...} objects).
+                  Assign:
+                    outerAccountId: "{% $states.input.accountId %}"
+                    splitResults: "{% $states.result %}"
+                  Output: {}
+                  Next: AccountSyncComplete
+
+                # Account-level summary: SUCCEEDED only if every split for
+                # this account SUCCEEDED. One split's FAILED does not stop
+                # later splits in a DIFFERENT account (outer Map isolates
+                # per-account failure).
+                #
+                # Reads $outerAccountId (assigned on RunSplits itself,
+                # above) — NOT $states.input.accountId. RunSplits's own
+                # Output: {} has already emptied $states.input for this
+                # state by the time we get here; see RunSplits's Assign
+                # comment for the execution failure this prevents
+                # (States.QueryEvaluationError, "$states.input.accountId
+                # ... returned nothing"), and for why this variable isn't
+                # just named $accountId (a same-name inner-scope variable
+                # already exists inside RunSplits's own ItemProcessor).
+                AccountSyncComplete:
+                  Type: Pass
+                  Output:
+                    accountId: "{% $outerAccountId %}"
+                    status: "{% $count($splitResults[status = 'FAILED']) = 0 ? 'SUCCEEDED' : 'FAILED' %}"
+                    splitCount: "{% $count($splitResults) %}"
+                    failedSplitCount: "{% $count($splitResults[status = 'FAILED']) %}"
+                    splits: "{% $splitResults %}"
+                  End: true
+            Assign:
+              accountResults: "{% $states.result %}"
+            Next: SummarizeResults
+
+          # Execution SUCCEEDS even when some accounts/splits failed (every
+          # account ran once); read failedAccounts to investigate/re-run
+          # individual accounts via cartography-lambda-sync directly, or fix
+          # the SSM splits entry and re-run this whole orchestrator (it is
+          # idempotent per account — no input needed, always full org scope).
+          SummarizeResults:
+            Type: Pass
+            Output:
+              totalAccountCount: "{% $count($accountResults) %}"
+              failedAccountCount: "{% $count($accountResults[status = 'FAILED']) %}"
+              succeededAccountCount: "{% $count($accountResults[status = 'SUCCEEDED']) %}"
+              failedAccounts: "{% $append([], $accountResults[status = 'FAILED'].accountId) %}"
+              results: "{% $accountResults %}"
+            End: true
+
+Outputs:
+  LoaderFunctionArn:
+    Value: !GetAtt CartographyLoaderFunction.Arn
+  StateMachineArn:
+    Value: !Ref CartographyLambdaStateMachine
+  LambdaSecurityGroupId:
+    Value: !Ref LambdaSecurityGroup
+  OrchestratorStateMachineArn:
+    Value: !Ref CartographyOrchestratorStateMachine
+  AccountSplitsParameterName:
+    Value: /cartography/lambda-orchestrator/account-splits
+  ExcludedAccountsParameterName:
+    Value: /cartography/lambda-orchestrator/excluded-accounts

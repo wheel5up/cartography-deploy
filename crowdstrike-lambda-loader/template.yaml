@@ -1,0 +1,314 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Cartography - CrowdStrike Falcon Lambda Loader. One Lambda, one Step
+  Functions state machine (one execution = one invocation), one EventBridge
+  schedule (daily 09:30 UTC, created DISABLED). Hosts plus a filtered set of
+  Spotlight vulnerabilities fit in a single invocation. See README.md.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC that Neo4j and the loaders run in.
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Private subnet with outbound internet (NAT), same VPC as Neo4j.
+
+  LambdaMemoryMb:
+    Type: Number
+    Default: 1024
+    Description: >
+      Two 5,000-record Spotlight pages are held in memory at once (prefetch).
+      Raise if a run reports high Max Memory Used.
+
+  SpotlightFilter:
+    Type: String
+    Default: "cve.severity:['CRITICAL','HIGH']+cve.exprt_rating:['HIGH','CRITICAL']"
+    Description: >
+      Extra FQL ANDed onto status:["open","reopen"]. Empty string collects
+      every open vulnerability, which can be millions and too slow for Lambda.
+      Changing it narrows/widens what cleanup keeps on the next run.
+
+  MinHostsForCleanup:
+    Type: Number
+    Default: 750
+    Description: >
+      Refuse cleanup when a run loads fewer hosts than this. Set to about
+      80% of your fleet; the default suits a fleet of about 950 hosts.
+
+  MinVulnsForCleanup:
+    Type: Number
+    Default: 30000
+    Description: >
+      Refuse cleanup when a run loads fewer vulnerabilities than this.
+      Set to about 80% of what a full run loads with your filter. Lower it if
+      you tighten SpotlightFilter, or every run will skip cleanup.
+
+  ScheduleDefault:
+    Type: String
+    Default: "cron(30 9 * * ? *)"
+    Description: >
+      Seed for /cartography/crowdstrike-lambda/schedule. Runs before the
+      ontology loader (10:00 UTC), so that day's CrowdstrikeHost nodes link
+      to Device.
+
+  ScheduleState:
+    Type: String
+    Default: ENABLED
+    AllowedValues: [ENABLED, DISABLED]
+    Description: Set to DISABLED to pause the daily schedule.
+
+Resources:
+
+  # ── Networking ─────────────────────────────────────────────────────────
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: cartography-crowdstrike-lambda-loader-sg
+      GroupDescription: Cartography CrowdStrike Lambda loader - outbound only
+      VpcId: !Ref VpcId
+      Tags:
+        - { Key: Name, Value: cartography-crowdstrike-lambda-loader-sg }
+        - { Key: Project, Value: cartography }
+
+  LambdaEgressHttps:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref LambdaSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: 0.0.0.0/0
+      Description: Outbound HTTPS (Falcon API, SSM)
+
+  LambdaEgressNeo4jBolt:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref LambdaSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8443
+      ToPort: 8443
+      DestinationSecurityGroupId: "{{resolve:ssm:/cartography/sg/neo4j}}"
+      Description: Bolt 8443 to Neo4j
+
+  Neo4jIngressFromCrowdstrikeLambda:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: "{{resolve:ssm:/cartography/sg/neo4j}}"
+      IpProtocol: tcp
+      FromPort: 8443
+      ToPort: 8443
+      SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      Description: Bolt 8443 from Cartography CrowdStrike Lambda loader
+
+  # ── Lambda ─────────────────────────────────────────────────────────────
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cartography-crowdstrike-lambda-loader-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: ReadNeo4jPassword
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cartography/neo4j/password"
+        - PolicyName: ReadCrowdstrikeConfig
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ssm:GetParameters
+                Resource:
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cartography/crowdstrike/client-id"
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cartography/crowdstrike/client-secret"
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cartography/crowdstrike/api-url"
+      Tags:
+        - { Key: Project, Value: cartography }
+
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /cartography/crowdstrike-lambda-loader
+      RetentionInDays: 30
+
+  CrowdstrikeLoaderFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: cartography-crowdstrike-lambda-loader
+      Handler: handler.handler
+      Runtime: python3.13
+      Architectures: [x86_64]
+      CodeUri: .
+      MemorySize: !Ref LambdaMemoryMb
+      Timeout: 900
+      Role: !GetAtt LambdaExecutionRole.Arn
+      VpcConfig:
+        SecurityGroupIds: [!Ref LambdaSecurityGroup]
+        SubnetIds: [!Ref SubnetId]
+      LoggingConfig:
+        LogGroup: !Ref LambdaLogGroup
+      Environment:
+        Variables:
+          NEO4J_URI: "bolt://{{resolve:ssm:/cartography/neo4j/private-ip}}:8443"
+          NEO4J_PASSWORD_SSM_PARAM: /cartography/neo4j/password
+          NEO4J_MAX_CONNECTION_LIFETIME: "200"
+          CROWDSTRIKE_SPOTLIGHT_FILTER: !Ref SpotlightFilter
+          CROWDSTRIKE_MIN_HOSTS_FOR_CLEANUP: !Ref MinHostsForCleanup
+          CROWDSTRIKE_MIN_VULNS_FOR_CLEANUP: !Ref MinVulnsForCleanup
+          # SSM parameter NAMES only; values are read at invoke time.
+          CROWDSTRIKE_SSM_PREFIX: /cartography/crowdstrike
+      Tags:
+        Project: cartography
+
+  # ── Step Functions: one execution = one invocation ─────────────────────
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cartography-crowdstrike-lambda-statemachine-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: states.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeLoaderLambda
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt CrowdstrikeLoaderFunction.Arn
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: "*"
+      Tags:
+        - { Key: Project, Value: cartography }
+
+  StateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /cartography/scheduler/crowdstrike-lambda
+      RetentionInDays: 30
+
+  # Input: {} or {"update_tag": <int>, "skip_vulnerabilities": bool,
+  # "skip_cleanup": bool}. A handler-reported FAILED becomes a Fail state.
+  CrowdstrikeSyncStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: cartography-crowdstrike-lambda-sync
+      RoleArn: !GetAtt StateMachineRole.Arn
+      LoggingConfiguration:
+        Level: ERROR
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup: { LogGroupArn: !GetAtt StateMachineLogGroup.Arn }
+      DefinitionSubstitutions:
+        Fn: !GetAtt CrowdstrikeLoaderFunction.Arn
+      Definition:
+        QueryLanguage: JSONata
+        StartAt: Invoke
+        States:
+          Invoke:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Arguments:
+              FunctionName: "${Fn}"
+              Payload: "{% $states.input %}"
+            Retry:
+              - ErrorEquals: [Lambda.ServiceException, Lambda.AWSLambdaException, Lambda.SdkClientException, Lambda.TooManyRequestsException]
+                IntervalSeconds: 2
+                MaxAttempts: 2
+                BackoffRate: 2
+            Output: "{% $states.result.Payload %}"
+            Next: Succeeded?
+          Succeeded?:
+            Type: Choice
+            Choices:
+              - Condition: "{% $states.input.status = 'SUCCEEDED' %}"
+                Next: Done
+            Default: SyncFailed
+          Done:
+            Type: Succeed
+          SyncFailed:
+            Type: Fail
+            Error: CrowdstrikeSyncFailed
+            Cause: "{% $string($states.input) %}"
+
+  # ── Schedule ───────────────────────────────────────────────────────────
+  ScheduleParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /cartography/crowdstrike-lambda/schedule
+      Type: String
+      Value: !Ref ScheduleDefault
+      Tags: { Project: cartography }
+
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cartography-crowdstrike-lambda-scheduler-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: scheduler.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StartStateMachine
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref CrowdstrikeSyncStateMachine
+      Tags:
+        - { Key: Project, Value: cartography }
+
+  # Change State via the ScheduleState parameter, not the CLI
+  # (a CLI flip is reverted by the next sam deploy).
+  CrowdstrikeLambdaSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: cartography-crowdstrike-lambda-daily
+      State: !Ref ScheduleState
+      ScheduleExpression: !Sub "{{resolve:ssm:${ScheduleParameter}}}"
+      ScheduleExpressionTimezone: UTC
+      FlexibleTimeWindow: { Mode: "OFF" }
+      Target:
+        Arn: !Ref CrowdstrikeSyncStateMachine
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: "{}"
+
+Outputs:
+  SyncStateMachineArn:
+    Value: !Ref CrowdstrikeSyncStateMachine
+  FunctionArn:
+    Value: !GetAtt CrowdstrikeLoaderFunction.Arn
+  LambdaLogGroup:
+    Value: !Ref LambdaLogGroup

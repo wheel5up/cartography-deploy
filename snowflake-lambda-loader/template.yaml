@@ -1,0 +1,831 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Cartography - Snowflake Lambda Loader. Two Step Functions state machines +
+  one Lambda, mirroring ../okta-lambda-loader's and ../lambda-loader's
+  sync/orchestrator split. cartography-snowflake-lambda-sync is a
+  single-task wrapper: one execution = one Lambda invocation, given an
+  explicit step list. cartography-snowflake-lambda-orchestrator drives a
+  FIXED sequence of such executions (one per split, from SSM), threading
+  one shared update_tag AND an accumulated "incomplete" module set through
+  all of them, then runs a final "cleanup" and "sync_complete" invocation —
+  see README.md "Cleanup: only modules that ran, and ran completely" for
+  why Snowflake needs this second piece of cross-invocation state that
+  Okta's own orchestrator does not. cleanup/sync_complete are separate Task
+  states after the Map rather than two more split entries so they always
+  see every split's results. A daily EventBridge schedule triggers the
+  orchestrator.
+
+Parameters:
+  LambdaMemoryMb:
+    Type: Number
+    Default: 2048
+    Description: >
+      At 512MB, the "grants" step can kill the Lambda with
+      Runtime.OutOfMemory — grants.sync() reads every direct grant row from
+      ACCOUNT_USAGE into memory before loading to Neo4j (about 1.1 million
+      rows on one account; see README.md "Default splits"). 2048MB fixed it
+      there. Every other step is network/API-bound, not
+      memory-heavy, so this bump is driven entirely by `grants`' one large
+      in-memory result set — revisit downward only if `grants` is ever
+      isolated into its own invocation with a tighter memory budget; do
+      NOT lower this while `grants` shares an invocation with other steps.
+
+  LambdaTimeoutSeconds:
+    Type: Number
+    Default: 900
+    MaxValue: 900
+    Description: >
+      900s (15 min) is Lambda's hard ceiling — cannot be raised. See
+      README.md "Default splits": `tables` (the slowest single module) is
+      the one that comes close to this ceiling, so it runs alone.
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC that Neo4j and the loaders run in.
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Private subnet with outbound internet (NAT), same VPC as Neo4j.
+
+  DefaultSplitsJson:
+    Type: String
+    Default: >-
+      [
+        {"steps": ["account","account_parameters","databases","schemas"]},
+        {"steps": ["network_rules","network_policies","roles","database_roles"]},
+        {"steps": ["users","access_tokens","credentials"]},
+        {"steps": ["resource_monitors","warehouses","compute_pools","external_volumes"]},
+        {"steps": ["storage_integrations","api_integrations","catalog_integrations","notification_integrations","security_integrations","external_access_integrations"]},
+        {"steps": ["tags","file_formats","stages","secrets","sequences"]},
+        {"steps": ["tables"]},
+        {"steps": ["views","materialized_views","external_tables","event_tables"]},
+        {"steps": ["iceberg_tables","dynamic_tables","streams"]},
+        {"steps": ["password_policies","session_policies","authentication_policies","data_policies"]},
+        {"steps": ["functions","procedures","pipes","tasks","alerts"]},
+        {"steps": ["cortex_search_services","notebooks","streamlits","artifact_repositories","image_repositories","services"]},
+        {"steps": ["shares","listings","replication_groups","policy_references","grants","account_grants","grants_cleanup"]}
+      ]
+    Description: >
+      Deploy-time seed for the SSM parameter
+      /cartography/snowflake-lambda/default-splits — a JSON array of FIXED,
+      pre-defined splits a normal (no-input) orchestrator run executes IN
+      ORDER, one cartography-snowflake-lambda-sync nested execution per
+      split. Deliberately does NOT include "cleanup" or "sync_complete" —
+      see this template's top-level Description for why those two are
+      separate stages the orchestrator runs itself, after this splits
+      list, rather than two more array entries. 13 splits, sized from
+      measured per-module timing where available (e.g. split 7 isolates
+      `tables`, the single slowest module); several splits combine modules
+      never individually timed, kept deliberately small as a safety
+      margin. See README.md "Default splits". Update via
+      `aws ssm put-parameter --overwrite` — no redeploy needed
+      (CloudFormation only seeds this value on stack create).
+
+  ScheduleDefault:
+    Type: String
+    Default: "cron(0 7 * * ? *)"
+    Description: >
+      Deploy-time seed for the SSM parameter
+      /cartography/snowflake-lambda/schedule. Default 07:00 UTC; each
+      loader has its own default slot so runs don't overlap. A full run
+      takes about an hour; keep this before the ontology loader (10:00
+      UTC).
+
+Resources:
+
+  # ── Security group ─────────────────────────────────────────────────────
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: cartography-snowflake-lambda-loader-sg
+      GroupDescription: Cartography Snowflake Lambda loader - outbound only
+      VpcId: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value: cartography-snowflake-lambda-loader-sg
+        - Key: Project
+          Value: cartography
+
+  LambdaEgressHttps:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref LambdaSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: 0.0.0.0/0
+      Description: Outbound HTTPS (Snowflake REST API, SSM GetParameter)
+
+  LambdaEgressNeo4jBolt:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref LambdaSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8443
+      ToPort: 8443
+      DestinationSecurityGroupId: "{{resolve:ssm:/cartography/sg/neo4j}}"
+      Description: Bolt 8443 to Neo4j
+
+  Neo4jIngressFromSnowflakeLambda:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: "{{resolve:ssm:/cartography/sg/neo4j}}"
+      IpProtocol: tcp
+      FromPort: 8443
+      ToPort: 8443
+      SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      Description: Bolt 8443 from Cartography Snowflake Lambda loader
+
+  # ── IAM role for the Lambda function ──────────────────────────────────
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cartography-snowflake-lambda-loader-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: ReadNeo4jPassword
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cartography/neo4j/password"
+        # Read the six Snowflake credential params at invoke time (with
+        # decryption for the two SecureStrings) — see handler.py's module
+        # docstring for why these are fetched at runtime rather than baked
+        # into environment variables.
+        - PolicyName: ReadSnowflakeCredentials
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cartography/snowflake/*"
+      Tags:
+        - Key: Project
+          Value: cartography
+
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /cartography/snowflake-lambda-loader
+      RetentionInDays: 30
+
+  # ── The Lambda function ───────────────────────────────────────────────
+  SnowflakeLoaderFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: cartography-snowflake-lambda-loader
+      Handler: handler.handler
+      Runtime: python3.13
+      Architectures: [x86_64]
+      CodeUri: .
+      MemorySize: !Ref LambdaMemoryMb
+      Timeout: !Ref LambdaTimeoutSeconds
+      Role: !GetAtt LambdaExecutionRole.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref SubnetId
+      LoggingConfig:
+        LogGroup: !Ref LambdaLogGroup
+      Environment:
+        Variables:
+          NEO4J_URI: "bolt://{{resolve:ssm:/cartography/neo4j/private-ip}}:8443"
+          NEO4J_PASSWORD_SSM_PARAM: /cartography/neo4j/password
+          NEO4J_MAX_CONNECTION_LIFETIME: "200"
+          # Skip lists are NOT env vars: the handler reads
+          # /cartography/snowflake/skip-databases and /skip-schemas from SSM
+          # at invoke time (covered by ReadSnowflakeCredentials' wildcard), so
+          # they change with `aws ssm put-parameter`, no redeploy.
+      Tags:
+        Project: cartography
+
+  # ── IAM role for Step Functions (both state machines) ──────────────────
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cartography-snowflake-lambda-statemachine-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeLoaderLambda
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt SnowflakeLoaderFunction.Arn
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: "*"
+      Tags:
+        - Key: Project
+          Value: cartography
+
+  StateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /cartography/scheduler/snowflake-lambda-loader
+      RetentionInDays: 30
+
+  # ── Step Functions state machine #1: single-task sync wrapper ──────────
+  # One execution = exactly ONE Lambda invocation. Mirrors
+  # ../okta-lambda-loader/template.yaml's CartographyOktaLambdaStateMachine
+  # exactly, with one addition: SyncComplete's Output now also surfaces
+  # "incomplete" (handler.py's new per-invocation incomplete-module list),
+  # which the orchestrator needs to accumulate across splits — see this
+  # template's top-level Description.
+  #
+  # Input: {"steps": [...], "update_tag"?: <int>, "incomplete"?: [...]}.
+  # "update_tag" is OPTIONAL — omit it to start a brand-new run. "incomplete"
+  # is OPTIONAL — only meaningful for a "cleanup" step invocation (see
+  # handler.py's module docstring).
+  CartographySnowflakeLambdaStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: cartography-snowflake-lambda-sync
+      RoleArn: !GetAtt StateMachineRole.Arn
+      LoggingConfiguration:
+        Level: ERROR
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StateMachineLogGroup.Arn
+      DefinitionSubstitutions:
+        LoaderFunctionArn: !GetAtt SnowflakeLoaderFunction.Arn
+      Definition:
+        QueryLanguage: JSONata
+        Comment: >
+          Single-task wrapper around the Snowflake Lambda loader. One
+          execution = one Lambda invocation with the given "steps" (and
+          optional "update_tag"/"incomplete"). No looping, no
+          step-grouping decisions made here — see
+          cartography-snowflake-lambda-orchestrator for that.
+        StartAt: InvokeLoader
+        States:
+
+          InvokeLoader:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Arguments:
+              FunctionName: "${LoaderFunctionArn}"
+              Payload:
+                steps: "{% $states.input.steps %}"
+                update_tag: "{% $exists($states.input.update_tag) ? $states.input.update_tag : null %}"
+                incomplete: "{% $exists($states.input.incomplete) ? $states.input.incomplete : null %}"
+                completed: "{% $exists($states.input.completed) ? $states.input.completed : null %}"
+            # Retry ONLY on Lambda-service-level failures, not on the
+            # handler's own reported failure and not on a timeout — same
+            # reasoning ../okta-lambda-loader/template.yaml's InvokeLoader
+            # state documents.
+            Retry:
+              - ErrorEquals:
+                  - Lambda.ServiceException
+                  - Lambda.AWSLambdaException
+                  - Lambda.SdkClientException
+                  - Lambda.TooManyRequestsException
+                IntervalSeconds: 2
+                MaxAttempts: 2
+                BackoffRate: 2
+            Catch:
+              - ErrorEquals: ["States.ALL"]
+                Next: SyncFailed
+                Assign:
+                  catchError: "{% $states.errorOutput %}"
+            Assign:
+              invokeResult: "{% $states.result.Payload %}"
+            Output: {}
+            Next: EvalInvokeResult
+
+          EvalInvokeResult:
+            Type: Choice
+            Choices:
+              - Condition: "{% $invokeResult.status = 'SUCCEEDED' %}"
+                Next: SyncComplete
+            Default: SyncFailed
+
+          SyncComplete:
+            Type: Pass
+            Output:
+              status: SUCCEEDED
+              updateTag: "{% $invokeResult.updateTag %}"
+              completed: "{% $invokeResult.completed %}"
+              incomplete: "{% $invokeResult.incomplete %}"
+              durationSeconds: "{% $invokeResult.durationSeconds %}"
+            End: true
+
+          # A genuine Fail state, not a Pass — same reasoning
+          # ../okta-lambda-loader/template.yaml's SyncFailed documents (a
+          # Pass-shaped failure can hide an outage for months).
+          SyncFailed:
+            Type: Fail
+            Error: SnowflakeSyncFailed
+            Cause: "{% $exists($invokeResult) ? $invokeResult.error : $string($catchError) %}"
+
+  StateMachineReadDefaultSplits:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Roles:
+        - !Ref StateMachineRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: ssm:GetParameter
+            Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cartography/snowflake-lambda/default-splits"
+
+  StateMachineInvokeNestedSync:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Roles:
+        - !Ref StateMachineRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: states:StartExecution
+            Resource: !Ref CartographySnowflakeLambdaStateMachine
+          - Effect: Allow
+            Action:
+              - states:DescribeExecution
+              - states:StopExecution
+            Resource: !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:cartography-snowflake-lambda-sync:*"
+          - Effect: Allow
+            Action:
+              - events:PutTargets
+              - events:PutRule
+              - events:DescribeRule
+            Resource: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsForStepFunctionsExecutionRule"
+
+  # ── Runtime-adjustable default splits list (SSM) ────────────────────────
+  # See DefaultSplitsJson's Description above for the full sizing rationale
+  # per split. Advanced tier for headroom — 13 splits is already a larger
+  # payload than Okta's 7.
+  DefaultSplitsParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /cartography/snowflake-lambda/default-splits
+      Type: String
+      Tier: Advanced
+      Value: !Ref DefaultSplitsJson
+      Description: >
+        JSON array of {"steps": [...]} splits, run in order, one
+        cartography-snowflake-lambda-sync nested execution per entry. Does
+        NOT include "cleanup" or "sync_complete" — those are separate
+        stages the orchestrator runs itself after this list, see
+        template.yaml's top-level Description.
+      Tags:
+        Project: cartography
+
+  # ── Step Functions state machine #2: fixed-split orchestrator ──────────
+  # No EventBridge schedule enabled yet — see CartographySnowflakeLambdaSchedule.
+  #
+  # Drives the FIXED splits list (one cartography-snowflake-lambda-sync
+  # nested execution per entry, strictly serial via Map MaxConcurrency: 1 —
+  # same mechanism ../okta-lambda-loader/template.yaml's own orchestrator
+  # uses), threading one shared update_tag through every split (same
+  # pattern as Okta). After the Map completes, computes the UNION of every
+  # split's own "incomplete" output and runs ONE final "cleanup" nested
+  # execution with that accumulated set, then ONE final "sync_complete"
+  # nested execution — see this template's top-level Description for why
+  # cleanup/sync_complete are structured this way instead of two more Map
+  # entries.
+  #
+  # Input options:
+  #   {}                       — full default run (reads the ordered
+  #                               splits list from
+  #                               /cartography/snowflake-lambda/default-splits)
+  #   {"splits": [{"steps": [...]}, ...]}
+  #                             — run exactly this ordered splits list
+  #                               instead (for a manual/debug run).
+  CartographySnowflakeLambdaOrchestratorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cartography-snowflake-lambda-orchestrator-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ReadDefaultSplits
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cartography/snowflake-lambda/default-splits"
+        - PolicyName: InvokeNestedSync
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref CartographySnowflakeLambdaStateMachine
+              - Effect: Allow
+                Action:
+                  - states:DescribeExecution
+                  - states:StopExecution
+                Resource: !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:cartography-snowflake-lambda-sync:*"
+              - Effect: Allow
+                Action:
+                  - events:PutTargets
+                  - events:PutRule
+                  - events:DescribeRule
+                Resource: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsForStepFunctionsExecutionRule"
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: "*"
+      Tags:
+        - Key: Project
+          Value: cartography
+
+  OrchestratorStateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /cartography/scheduler/snowflake-lambda-orchestrator
+      RetentionInDays: 30
+
+  CartographySnowflakeLambdaOrchestrator:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: cartography-snowflake-lambda-orchestrator
+      RoleArn: !GetAtt CartographySnowflakeLambdaOrchestratorRole.Arn
+      LoggingConfiguration:
+        Level: ERROR
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt OrchestratorStateMachineLogGroup.Arn
+      DefinitionSubstitutions:
+        SyncStateMachineArn: !Ref CartographySnowflakeLambdaStateMachine
+      Definition:
+        QueryLanguage: JSONata
+        Comment: >
+          Drives the fixed splits list, one cartography-snowflake-lambda-
+          sync nested execution per split, strictly in order, threading one
+          shared update_tag through all of them. After every split
+          succeeds, unions their individual "incomplete" outputs and runs
+          one final "cleanup" nested execution with that accumulated set,
+          then one final "sync_complete" nested execution. Any nested
+          execution failing stops the whole orchestrator run immediately.
+        StartAt: ResolveSplits
+        States:
+
+          # Same mechanism and same AWS-docs-backed rationale as
+          # ../okta-lambda-loader/template.yaml's own ResolveSplits — see
+          # that state's comment for the full citation on why
+          # $sharedUpdateTag is generated ONCE here, before the Map, rather
+          # than threaded iteration-to-iteration.
+          ResolveSplits:
+            Type: Choice
+            Choices:
+              - Condition: "{% $exists($states.input.splits) and $count($states.input.splits) > 0 %}"
+                Assign:
+                  splits: "{% $states.input.splits %}"
+                  sharedUpdateTag: "{% $floor($millis() / 1000) %}"
+                Next: RunSplits
+            Default: GetDefaultSplits
+
+          GetDefaultSplits:
+            Type: Task
+            Resource: arn:aws:states:::aws-sdk:ssm:getParameter
+            Arguments:
+              Name: /cartography/snowflake-lambda/default-splits
+            Assign:
+              splits: "{% $parse($states.result.Parameter.Value) %}"
+              sharedUpdateTag: "{% $floor($millis() / 1000) %}"
+            Output: {}
+            Next: RunSplits
+
+          # Serial Map (MaxConcurrency: 1) over the fixed splits list.
+          # Deliberately does NOT include "cleanup" or "sync_complete" as
+          # entries — see this template's top-level Description. Each
+          # iteration's RunOneSplit captures BOTH its own splitIndex (for
+          # diagnostics) AND the nested execution's actual "incomplete"
+          # output directly in its Output, via $states.result (the task's
+          # raw result, evaluated BEFORE this state's own Output
+          # transformation is applied) — this differs from
+          # ../okta-lambda-loader/template.yaml's own RunOneSplit, which
+          # only needed to pass splitIndex through (Okta has no equivalent
+          # "incomplete" concept to accumulate).
+          #
+          # After the Map completes, $states.result here refers to the
+          # Map's own aggregated result — an array of every iteration's
+          # Output ({splitIndex, status, incomplete}) — which IS readable
+          # in this OUTER scope (unlike inside an iteration). The Assign
+          # block computes accumulatedIncomplete from it, relying on
+          # JSONata's sequence-flatten behavior when a path is applied
+          # across an array of objects each holding an array field.
+          #
+          # Output must NOT read `$accumulatedIncomplete` — the variable
+          # this SAME state's Assign sets. AWS docs: Assign and Output are
+          # evaluated IN PARALLEL, and "new variable values will be
+          # available starting with the NEXT state" — so Output would see
+          # it as undefined and the run would fail with
+          # States.QueryEvaluationError AFTER every split had succeeded.
+          # Output recomputes the expression directly from $states.result
+          # instead; RunCleanup (the NEXT state) reads
+          # $accumulatedIncomplete, which is correct there.
+          #
+          # $append([], ...) wraps the flatten so the result is ALWAYS an
+          # array: without it, JSONata returns undefined when every split
+          # reported zero incomplete modules (empty sequence), and a bare
+          # string (not a 1-element array) when exactly one module name
+          # survives — either would break RunCleanup's Lambda payload,
+          # which expects a list.
+          RunSplits:
+            Type: Map
+            Items: "{% $splits %}"
+            ItemSelector:
+              splitIndex: "{% $states.context.Map.Item.Index %}"
+              steps: "{% $states.context.Map.Item.Value.steps %}"
+              updateTag: "{% $sharedUpdateTag %}"
+            MaxConcurrency: 1
+            # accumulatedCompleted: union of every split's `completed` step
+            # list. RunCleanup only cleans modules in this set AND not in
+            # accumulatedIncomplete. Without it, a 2-split run's cleanup
+            # deletes every module that never ran (tables/views/users/
+            # roles/...). See handler.py run_cleanup.
+            Assign:
+              accumulatedIncomplete: "{% $distinct($append([], $states.result.incomplete)) %}"
+              accumulatedCompleted: "{% $distinct($append([], $states.result.completed)) %}"
+            Output:
+              status: SUCCEEDED
+              updateTag: "{% $sharedUpdateTag %}"
+              splitsCompleted: "{% $count($splits) %}"
+              incomplete: "{% $distinct($append([], $states.result.incomplete)) %}"
+            ItemProcessor:
+              ProcessorConfig:
+                Mode: INLINE
+              StartAt: RunOneSplit
+              States:
+                RunOneSplit:
+                  Type: Task
+                  Resource: arn:aws:states:::states:startExecution.sync:2
+                  Arguments:
+                    StateMachineArn: "${SyncStateMachineArn}"
+                    Name: |-
+                      {%
+                        "sf-orch-"
+                        & $split($states.context.Execution.Name, "-")[0]
+                        & "-"
+                        & $string($states.input.splitIndex)
+                        & "-"
+                        & $string($millis())
+                      %}
+                    Input:
+                      steps: "{% $states.input.steps %}"
+                      update_tag: "{% $states.input.updateTag %}"
+                  Retry:
+                    - ErrorEquals:
+                        - StepFunctions.ExecutionLimitExceeded
+                        - StepFunctions.ServiceException
+                      IntervalSeconds: 2
+                      MaxAttempts: 3
+                      BackoffRate: 2
+                  Catch:
+                    - ErrorEquals: ["States.ALL"]
+                      Next: SplitFailed
+                      Assign:
+                        catchError: "{% $states.errorOutput %}"
+                  # Captures splitIndex (from this state's own INPUT, set
+                  # by the outer Map's ItemSelector) together with the
+                  # nested execution's actual incomplete-module output
+                  # (from $states.result, this Task's raw result BEFORE
+                  # this Output expression is applied — the nested
+                  # execution's own final Output, i.e.
+                  # cartography-snowflake-lambda-sync's SyncComplete
+                  # Output shape). See this Map's own preceding comment for
+                  # why both pieces are needed here, unlike
+                  # ../okta-lambda-loader/template.yaml's equivalent state.
+                  Output:
+                    splitIndex: "{% $states.input.splitIndex %}"
+                    incomplete: "{% $states.result.Output.incomplete %}"
+                    completed: "{% $states.result.Output.completed %}"
+                  Next: SplitComplete
+
+                SplitComplete:
+                  Type: Pass
+                  Output:
+                    splitIndex: "{% $states.input.splitIndex %}"
+                    incomplete: "{% $states.input.incomplete %}"
+                    completed: "{% $states.input.completed %}"
+                    status: SUCCEEDED
+                  End: true
+
+                SplitFailed:
+                  Type: Fail
+                  Error: SnowflakeSplitFailed
+                  Cause: "{% $string($catchError) %}"
+            Next: RunCleanup
+
+          # Separate, single nested execution — NOT part of the Map above —
+          # given the full accumulated incomplete set as computed by
+          # RunSplits's own Assign block. See this template's top-level
+          # Description for why cleanup must be structured this way.
+          RunCleanup:
+            Type: Task
+            Resource: arn:aws:states:::states:startExecution.sync:2
+            Arguments:
+              StateMachineArn: "${SyncStateMachineArn}"
+              Name: |-
+                {%
+                  "sf-orch-"
+                  & $split($states.context.Execution.Name, "-")[0]
+                  & "-cleanup-"
+                  & $string($millis())
+                %}
+              Input:
+                steps: ["cleanup"]
+                update_tag: "{% $sharedUpdateTag %}"
+                incomplete: "{% $accumulatedIncomplete %}"
+                completed: "{% $accumulatedCompleted %}"
+            Retry:
+              - ErrorEquals:
+                  - StepFunctions.ExecutionLimitExceeded
+                  - StepFunctions.ServiceException
+                IntervalSeconds: 2
+                MaxAttempts: 3
+                BackoffRate: 2
+            Catch:
+              - ErrorEquals: ["States.ALL"]
+                Next: CleanupFailed
+                Assign:
+                  catchError: "{% $states.errorOutput %}"
+            Output: {}
+            Next: RunSyncComplete
+
+          CleanupFailed:
+            Type: Fail
+            Error: SnowflakeCleanupFailed
+            Cause: "{% $string($catchError) %}"
+
+          # Final nested execution: writes the ModuleSyncMetadata receipt
+          # node, same reasoning as
+          # ../okta-lambda-loader/template.yaml's own last "sync_complete"
+          # split. Only runs if every split above AND cleanup succeeded,
+          # by the same "a failure stops the whole execution" property
+          # every other stage in this orchestrator already has.
+          RunSyncComplete:
+            Type: Task
+            Resource: arn:aws:states:::states:startExecution.sync:2
+            Arguments:
+              StateMachineArn: "${SyncStateMachineArn}"
+              Name: |-
+                {%
+                  "sf-orch-"
+                  & $split($states.context.Execution.Name, "-")[0]
+                  & "-sync-complete-"
+                  & $string($millis())
+                %}
+              Input:
+                steps: ["sync_complete"]
+                update_tag: "{% $sharedUpdateTag %}"
+            Retry:
+              - ErrorEquals:
+                  - StepFunctions.ExecutionLimitExceeded
+                  - StepFunctions.ServiceException
+                IntervalSeconds: 2
+                MaxAttempts: 3
+                BackoffRate: 2
+            Catch:
+              - ErrorEquals: ["States.ALL"]
+                Next: SyncCompleteFailed
+                Assign:
+                  catchError: "{% $states.errorOutput %}"
+            Output:
+              status: SUCCEEDED
+              updateTag: "{% $sharedUpdateTag %}"
+            End: true
+
+          SyncCompleteFailed:
+            Type: Fail
+            Error: SnowflakeSyncCompleteFailed
+            Cause: "{% $string($catchError) %}"
+
+  # ── Runtime-adjustable schedule (SSM) ───────────────────────────────────
+  SnowflakeLambdaScheduleParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /cartography/snowflake-lambda/schedule
+      Type: String
+      Value: !Ref ScheduleDefault
+      Description: >
+        EventBridge schedule expression for the daily
+        cartography-snowflake-lambda-orchestrator run. Resolved into the
+        schedule at deploy time.
+      Tags:
+        Project: cartography
+
+  # ── IAM role for EventBridge Scheduler ──────────────────────────────────
+  SnowflakeLambdaSchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cartography-snowflake-lambda-scheduler-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StartOrchestratorStateMachine
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref CartographySnowflakeLambdaOrchestrator
+      Tags:
+        - Key: Project
+          Value: cartography
+
+  # ── EventBridge Scheduler ───────────────────────────────────────────────
+  # Triggers cartography-snowflake-lambda-orchestrator daily. Change State here, not
+  # via `aws scheduler update-schedule` — a CLI flip is reverted by the next
+  # `sam deploy`.
+  CartographySnowflakeLambdaSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: cartography-snowflake-lambda-daily
+      Description: >
+        Triggers the daily cartography-snowflake-lambda-orchestrator run
+        (full default splits list).
+      State: ENABLED
+      ScheduleExpression: !Sub "{{resolve:ssm:${SnowflakeLambdaScheduleParameter}}}"
+      ScheduleExpressionTimezone: UTC
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !Ref CartographySnowflakeLambdaOrchestrator
+        RoleArn: !GetAtt SnowflakeLambdaSchedulerRole.Arn
+        Input: "{}"
+
+Outputs:
+  StateMachineArn:
+    Value: !Ref CartographySnowflakeLambdaStateMachine
+    Description: ARN of the single-task cartography-snowflake-lambda-sync Step Functions state machine
+  OrchestratorStateMachineArn:
+    Value: !Ref CartographySnowflakeLambdaOrchestrator
+    Description: ARN of the cartography-snowflake-lambda-orchestrator Step Functions state machine
+  FunctionArn:
+    Value: !GetAtt SnowflakeLoaderFunction.Arn
+    Description: ARN of the Snowflake Lambda loader function
+  LambdaLogGroup:
+    Value: !Ref LambdaLogGroup
+    Description: CloudWatch log group for Lambda execution logs
+  StateMachineLogGroup:
+    Value: !Ref StateMachineLogGroup
+    Description: CloudWatch log group for cartography-snowflake-lambda-sync execution logs
+  OrchestratorStateMachineLogGroup:
+    Value: !Ref OrchestratorStateMachineLogGroup
+    Description: CloudWatch log group for cartography-snowflake-lambda-orchestrator execution logs
+  ScheduleName:
+    Value: !Ref CartographySnowflakeLambdaSchedule
+    Description: EventBridge schedule name for the daily orchestrator run

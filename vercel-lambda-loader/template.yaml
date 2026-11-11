@@ -1,0 +1,815 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Cartography - Vercel Lambda Loader. Two Step Functions state machines +
+  one Lambda, mirroring ../okta-lambda-loader's sync/orchestrator split.
+  cartography-vercel-lambda-sync is a single-task wrapper: one execution =
+  one Lambda invocation, given an explicit step list.
+  cartography-vercel-lambda-orchestrator drives a FIXED sequence of such
+  executions (one per split, from SSM), threading one shared update_tag
+  through all of them. An EventBridge schedule triggers the orchestrator
+  daily. The whole Vercel sync fits in one invocation, unlike Okta/AWS, so
+  the default splits list has exactly ONE entry. See README.md.
+
+Parameters:
+  LambdaMemoryMb:
+    Type: Number
+    Default: 512
+    Description: >
+      The Vercel sync is network/API-bound (paginated HTTP calls per
+      submodule, heaviest being the per-project loop and the aliases list),
+      not memory-heavy. 512MB is a starting point — Lambda also scales CPU
+      with memory, so more memory can incidentally mean faster wall time if
+      any phase turns out to be CPU-bound (e.g. JSON transform of a large
+      deployment list).
+
+  LambdaTimeoutSeconds:
+    Type: Number
+    Default: 900
+    MaxValue: 900
+    Description: >
+      900s (15 min) is Lambda's hard ceiling — cannot be raised. Kept
+      explicit so every invocation always gets the Lambda's full available
+      runway. A full sync for an org of about 70 projects took about 360s,
+      40% of this budget (see src/handler.py's docstring).
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC that Neo4j and the loaders run in.
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Private subnet with outbound internet (NAT), same VPC as Neo4j.
+
+  DefaultSplitsJson:
+    Type: String
+    Default: >-
+      [
+        {"steps": ["teams","users","projects","domains","edge_configs",
+          "shared_env_vars","integrations","access_groups","webhooks",
+          "log_drains","secure_compute_networks","aliases",
+          "project_resources","domain_resources","edge_config_resources",
+          "label_migration"]}
+      ]
+    Description: >
+      Deploy-time seed for the SSM parameter
+      /cartography/vercel-lambda/default-splits — a JSON array of FIXED,
+      pre-defined splits a normal (no-input) orchestrator run executes IN
+      ORDER, one cartography-vercel-lambda-sync nested execution per split
+      — same shape as ../okta-lambda-loader/template.yaml's
+      DefaultSplitsJson. Unlike Okta (which needs multiple splits because
+      its `applications` step alone exceeds 900s), the WHOLE Vercel sync
+      comfortably fits in a single Lambda invocation — so this default has
+      exactly ONE split containing every step from handler.py's
+      DEFAULT_STEPS, in start_vercel_ingestion()'s own phase order. If
+      growth ever requires splitting (see the per-project-loop growth note
+      in src/handler.py's docstring), add more {"steps": [...]} entries here — no
+      template or handler change needed. Update via `aws ssm put-parameter
+      --overwrite` — no redeploy needed (CloudFormation only seeds this
+      value on stack create).
+
+  ScheduleDefault:
+    Type: String
+    Default: "cron(0 6 * * ? *)"
+    Description: >
+      Deploy-time seed for the SSM parameter
+      /cartography/vercel-lambda/schedule, which drives the EventBridge
+      schedule that triggers cartography-vercel-lambda-orchestrator daily.
+      Default 06:00 UTC; each loader has its own default slot so runs
+      don't overlap.
+      This stack's own schedule is created DISABLED (see
+      CartographyVercelLambdaSchedule). To change the live
+      schedule: update the SSM parameter and redeploy (the
+      ScheduleExpression below is resolved from SSM at deploy time;
+      EventBridge cannot read SSM at trigger time) — same pattern as every
+      other scheduler stack in this repo.
+
+Resources:
+
+  # ── Security group ─────────────────────────────────────────────────────
+  # A new, dedicated SG (not a reuse of cartography-lambda-loader-sg or
+  # cartography-okta-lambda-loader-sg) so
+  # this stack can be torn down without touching a resource any of those
+  # depend on — same reasoning ../okta-lambda-loader/template.yaml and
+  # ../lambda-loader/template.yaml use for their own SGs.
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: cartography-vercel-lambda-loader-sg
+      GroupDescription: Cartography Vercel Lambda loader - outbound only
+      VpcId: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value: cartography-vercel-lambda-loader-sg
+        - Key: Project
+          Value: cartography
+
+  LambdaEgressHttps:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref LambdaSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: 0.0.0.0/0
+      Description: Outbound HTTPS (Vercel API, SSM GetParameter)
+
+  LambdaEgressNeo4jBolt:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref LambdaSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8443
+      ToPort: 8443
+      DestinationSecurityGroupId: "{{resolve:ssm:/cartography/sg/neo4j}}"
+      Description: Bolt 8443 to Neo4j
+
+  # Allow this Lambda's ENI in on the Neo4j SG. Distinct from the AWS Lambda
+  # loader's rule (scoped to cartography-lambda-loader-sg), and the Okta
+  # Lambda loader's rule (scoped to cartography-okta-lambda-loader-sg) —
+  # each consuming stack adds its own explicit allow rather than widening
+  # an existing one. This is additive: it does not modify or replace any
+  # other loader's existing rule on cartography-neo4j-sg.
+  Neo4jIngressFromVercelLambda:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: "{{resolve:ssm:/cartography/sg/neo4j}}"
+      IpProtocol: tcp
+      FromPort: 8443
+      ToPort: 8443
+      SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      Description: Bolt 8443 from Cartography Vercel Lambda loader
+
+  # ── IAM role for the Lambda function ──────────────────────────────────
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cartography-vercel-lambda-loader-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # Required for a Lambda attached to a VPC to create/manage its ENIs.
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: ReadNeo4jPassword
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cartography/neo4j/password"
+        # Read the Vercel API token at invoke time (with decryption) — see
+        # handler.py's module docstring / _get_vercel_api_token for why
+        # this is fetched at runtime rather than baked into the Lambda's
+        # environment variables.
+        - PolicyName: ReadVercelToken
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cartography/vercel/token"
+      Tags:
+        - Key: Project
+          Value: cartography
+
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /cartography/vercel-lambda-loader
+      RetentionInDays: 30
+
+  # ── The Lambda function ───────────────────────────────────────────────
+  VercelLoaderFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: cartography-vercel-lambda-loader
+      Handler: handler.handler
+      Runtime: python3.13
+      Architectures: [x86_64]
+      CodeUri: .
+      MemorySize: !Ref LambdaMemoryMb
+      Timeout: !Ref LambdaTimeoutSeconds
+      Role: !GetAtt LambdaExecutionRole.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref SubnetId
+      LoggingConfig:
+        LogGroup: !Ref LambdaLogGroup
+      Environment:
+        Variables:
+          NEO4J_URI: "bolt://{{resolve:ssm:/cartography/neo4j/private-ip}}:8443"
+          NEO4J_PASSWORD_SSM_PARAM: /cartography/neo4j/password
+          NEO4J_MAX_CONNECTION_LIFETIME: "200"
+          # Vercel's API accepts either the team slug or the raw team_...
+          # ID for this value. This Lambda resolves the slug from
+          # /cartography/vercel/team-slug via a deploy-time dynamic
+          # reference rather than at runtime — same tradeoff as every other non-sensitive,
+          # infrequently-changed SSM-backed config value in this repo
+          # (e.g. OKTA_ORG_ID in ../okta-lambda-loader/template.yaml is a
+          # literal, not a dynamic ref, for the same reason: it practically
+          # never changes and a dynamic ref would need a redeploy to
+          # re-resolve anyway, same cost as just editing the template).
+          VERCEL_TEAM_ID: "{{resolve:ssm:/cartography/vercel/team-slug}}"
+          VERCEL_BASE_URL: https://api.vercel.com
+          # Name of the SSM parameter holding the Vercel API token — NOT
+          # the token itself. See ReadVercelToken policy above and
+          # handler.py's _get_vercel_api_token().
+          VERCEL_TOKEN_SSM_PARAM: /cartography/vercel/token
+      Tags:
+        Project: cartography
+
+  # ── IAM role for Step Functions (both state machines) ──────────────────
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cartography-vercel-lambda-statemachine-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeLoaderLambda
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt VercelLoaderFunction.Arn
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: "*"
+      Tags:
+        - Key: Project
+          Value: cartography
+
+  StateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /cartography/scheduler/vercel-lambda-loader
+      RetentionInDays: 30
+
+  # ── Step Functions state machine #1: single-task sync wrapper ──────────
+  # One execution = exactly ONE Lambda invocation. Does NOT loop, does NOT
+  # decide what steps to run — it is handed an explicit step list (and,
+  # for a continuation call, an update_tag) and simply invokes the Lambda
+  # once with that payload. This mirrors ../okta-lambda-loader's own
+  # cartography-okta-lambda-sync exactly (that one is also a thin
+  # single-task wrapper; cartography-vercel-lambda-orchestrator, below, is
+  # the thing that drives many of them). Running this state machine
+  # directly (not via the orchestrator) is the easiest way to test one
+  # split/step in isolation — see README.md "Run manually".
+  #
+  # Input: {"steps": [...], "update_tag"?: <int>}. "update_tag" is
+  # OPTIONAL — omit it to start a brand-new run (the Lambda generates a
+  # fresh tag and reports it back in the output); pass a prior run's
+  # updateTag to continue that same run's data under its existing tag.
+  CartographyVercelLambdaStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: cartography-vercel-lambda-sync
+      RoleArn: !GetAtt StateMachineRole.Arn
+      LoggingConfiguration:
+        Level: ERROR
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StateMachineLogGroup.Arn
+      DefinitionSubstitutions:
+        LoaderFunctionArn: !GetAtt VercelLoaderFunction.Arn
+      Definition:
+        QueryLanguage: JSONata
+        Comment: >
+          Single-task wrapper around the Vercel Lambda loader. One execution
+          = one Lambda invocation with the given "steps" (and optional
+          "update_tag"). No looping, no step-grouping decisions made here
+          — see cartography-vercel-lambda-orchestrator for that. A FAILED
+          invocation ends this execution with AWS-level status FAILED.
+        StartAt: InvokeLoader
+        States:
+
+          InvokeLoader:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Arguments:
+              FunctionName: "${LoaderFunctionArn}"
+              Payload:
+                steps: "{% $states.input.steps %}"
+                update_tag: "{% $exists($states.input.update_tag) ? $states.input.update_tag : null %}"
+            # Retry ONLY on Lambda-service-level failures (throttling,
+            # transient invoke errors) — NOT on the handler's own reported
+            # failure (a 200 response body with status:"FAILED") and NOT
+            # on a timeout. Same Retry/Catch shape as
+            # ../okta-lambda-loader/template.yaml's InvokeLoader state.
+            Retry:
+              - ErrorEquals:
+                  - Lambda.ServiceException
+                  - Lambda.AWSLambdaException
+                  - Lambda.SdkClientException
+                  - Lambda.TooManyRequestsException
+                IntervalSeconds: 2
+                MaxAttempts: 2
+                BackoffRate: 2
+            Catch:
+              - ErrorEquals: ["States.ALL"]
+                Next: SyncFailed
+                Assign:
+                  catchError: "{% $states.errorOutput %}"
+            Assign:
+              invokeResult: "{% $states.result.Payload %}"
+            Output: {}
+            Next: EvalInvokeResult
+
+          EvalInvokeResult:
+            Type: Choice
+            Choices:
+              - Condition: "{% $invokeResult.status = 'SUCCEEDED' %}"
+                Next: SyncComplete
+            Default: SyncFailed
+
+          SyncComplete:
+            Type: Pass
+            Output:
+              status: SUCCEEDED
+              updateTag: "{% $invokeResult.updateTag %}"
+              completed: "{% $invokeResult.completed %}"
+              durationSeconds: "{% $invokeResult.durationSeconds %}"
+            End: true
+
+          # A genuine Fail state, not a Pass — this state machine has no
+          # Map/fan-out (one execution = one Lambda invocation), so there
+          # is no "keep going for other items" concern a Pass state would
+          # protect. Same rationale as
+          # ../okta-lambda-loader/template.yaml's SyncFailed state.
+          SyncFailed:
+            Type: Fail
+            Error: VercelSyncFailed
+            Cause: "{% $exists($invokeResult) ? $invokeResult.error : $string($catchError) %}"
+
+  # Add SSM read permission for the default-splits parameter to the same
+  # role used for Lambda invocation above (kept as a separate Policy block
+  # for readability, attached to the same StateMachineRole) — same pattern
+  # ../okta-lambda-loader/template.yaml's StateMachineReadDefaultSplits uses.
+  StateMachineReadDefaultSplits:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Roles:
+        - !Ref StateMachineRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: ssm:GetParameter
+            Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cartography/vercel-lambda/default-splits"
+
+  # Nested-execution permissions so the orchestrator can call
+  # cartography-vercel-lambda-sync synchronously (startExecution.sync:2) —
+  # same permission shape ../okta-lambda-loader/template.yaml's own
+  # orchestrator uses for its own nested calls: states:StartExecution
+  # needs the STATE MACHINE arn; DescribeExecution/StopExecution need the
+  # EXECUTION arn (a different resource shape); the events:* triple lets
+  # Step Functions use EventBridge (instead of pure polling) to learn when
+  # the nested execution completes.
+  StateMachineInvokeNestedSync:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Roles:
+        - !Ref StateMachineRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: states:StartExecution
+            Resource: !Ref CartographyVercelLambdaStateMachine
+          - Effect: Allow
+            Action:
+              - states:DescribeExecution
+              - states:StopExecution
+            Resource: !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:cartography-vercel-lambda-sync:*"
+          - Effect: Allow
+            Action:
+              - events:PutTargets
+              - events:PutRule
+              - events:DescribeRule
+            Resource: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsForStepFunctionsExecutionRule"
+
+  # ── Runtime-adjustable default splits list (SSM) ────────────────────────
+  # JSON array of {"steps": [...]} splits a normal (no-input) orchestrator
+  # run executes, IN ORDER, one cartography-vercel-lambda-sync nested
+  # execution per entry. See DefaultSplitsJson's Description above. NOTE:
+  # CloudFormation only sets this value on stack *create*; a later
+  # `sam deploy` will NOT overwrite an out-of-band edit — same pattern as
+  # ../okta-lambda-loader/template.yaml's DefaultSplitsParameter and
+  # ../lambda-loader/template.yaml's AccountSplitsParameter.
+  #   aws ssm put-parameter --overwrite \
+  #     --name /cartography/vercel-lambda/default-splits --value '[...]'
+  DefaultSplitsParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /cartography/vercel-lambda/default-splits
+      Type: String
+      Tier: Standard
+      Value: !Ref DefaultSplitsJson
+      Description: >
+        JSON array of {"steps": [...]} splits, run in order, one
+        cartography-vercel-lambda-sync nested execution per entry. Read at
+        execution start by cartography-vercel-lambda-orchestrator when no
+        explicit "splits" override is given in the execution input. Must
+        stay in sync with handler.py's DEFAULT_STEPS (today: one split
+        containing every step — see DefaultSplitsJson's Description above
+        for why, unlike Okta, this doesn't need multiple splits).
+      Tags:
+        Project: cartography
+
+  # ── Step Functions state machine #2: fixed-split orchestrator ──────────
+  # No EventBridge schedule directly on this state machine's own
+  # definition — the schedule (CartographyVercelLambdaSchedule, below)
+  # targets THIS orchestrator, not the sync state machine directly, same
+  # as ../okta-lambda-loader's CartographyOktaLambdaSchedule targets its
+  # own orchestrator. See README.md "Run manually" for manual
+  # start-execution commands.
+  #
+  # Drives a FIXED, pre-defined SEQUENCE of cartography-vercel-lambda-sync
+  # nested executions — one per split in the splits list (from SSM, or an
+  # explicit {"splits": [...]} override) — run strictly IN ORDER (a Map
+  # with MaxConcurrency: 1, which forces serial execution; today's default
+  # splits list has exactly one entry, so this is a degenerate one-iteration
+  # loop in practice, but the mechanism is identical to Okta's in case a
+  # future split ever adds a second entry). Each split's execution is a
+  # SEPARATE, independently-visible nested execution with its own distinct
+  # Step Functions input — unlike a Lambda-side runtime loop, this makes
+  # every invocation's actual payload directly visible via
+  # `describe-execution` on that specific nested execution ARN, no digging
+  # through parent-execution event history required.
+  #
+  # ANY nested execution failing (cartography-vercel-lambda-sync's own
+  # Fail state, see that state machine's SyncFailed) propagates up and
+  # stops this orchestrator's execution immediately — no partial-success
+  # continuation to later splits. Same fail-fast rationale
+  # ../okta-lambda-loader/template.yaml documents for its own orchestrator.
+  #
+  # Input options:
+  #   {}                       — full default run (reads the ordered
+  #                               splits list from
+  #                               /cartography/vercel-lambda/default-splits)
+  #   {"splits": [{"steps": [...]}, ...]}
+  #                             — run exactly this ordered splits list
+  #                               instead (for a manual/debug run).
+  CartographyVercelLambdaOrchestratorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cartography-vercel-lambda-orchestrator-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ReadDefaultSplits
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cartography/vercel-lambda/default-splits"
+        - PolicyName: InvokeNestedSync
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref CartographyVercelLambdaStateMachine
+              - Effect: Allow
+                Action:
+                  - states:DescribeExecution
+                  - states:StopExecution
+                Resource: !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:cartography-vercel-lambda-sync:*"
+              - Effect: Allow
+                Action:
+                  - events:PutTargets
+                  - events:PutRule
+                  - events:DescribeRule
+                Resource: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsForStepFunctionsExecutionRule"
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: "*"
+      Tags:
+        - Key: Project
+          Value: cartography
+
+  OrchestratorStateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /cartography/scheduler/vercel-lambda-orchestrator
+      RetentionInDays: 30
+
+  CartographyVercelLambdaOrchestrator:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: cartography-vercel-lambda-orchestrator
+      RoleArn: !GetAtt CartographyVercelLambdaOrchestratorRole.Arn
+      LoggingConfiguration:
+        Level: ERROR
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt OrchestratorStateMachineLogGroup.Arn
+      DefinitionSubstitutions:
+        SyncStateMachineArn: !Ref CartographyVercelLambdaStateMachine
+      Definition:
+        QueryLanguage: JSONata
+        Comment: >
+          Drives a FIXED, pre-defined sequence of
+          cartography-vercel-lambda-sync nested executions, one per split
+          (from SSM or an explicit {"splits": [...]} override), strictly in
+          order, threading one shared update_tag through all of them. Any
+          nested execution failing stops the whole orchestrator run
+          immediately. See template.yaml's surrounding comments and
+          README.md for the full design.
+        StartAt: ResolveSplits
+        States:
+
+          # An explicit {"splits": [...]} input always wins; {} (or any
+          # input with no "splits" key) reads the default list from SSM.
+          #
+          # ALSO generates the one shared update_tag HERE, up front, before
+          # any split runs — NOT by threading a Step-Functions variable
+          # forward from one Map iteration's result to the next. Same
+          # reasoning ../okta-lambda-loader/template.yaml's ResolveSplits
+          # documents in full: Step Functions' own docs are explicit that a
+          # variable assigned inside one Map iteration is invisible to the
+          # next iteration and goes out of scope once the Map completes.
+          # Generating the tag before the Map, as an outer-scope variable
+          # every iteration can read, sidesteps that limitation entirely.
+          # $floor($millis() / 1000) mirrors handler.py's own
+          # int(time.time()) exactly (epoch seconds, not millis).
+          ResolveSplits:
+            Type: Choice
+            Choices:
+              - Condition: "{% $exists($states.input.splits) and $count($states.input.splits) > 0 %}"
+                Assign:
+                  splits: "{% $states.input.splits %}"
+                  sharedUpdateTag: "{% $floor($millis() / 1000) %}"
+                Next: RunSplits
+            Default: GetDefaultSplits
+
+          GetDefaultSplits:
+            Type: Task
+            Resource: arn:aws:states:::aws-sdk:ssm:getParameter
+            Arguments:
+              Name: /cartography/vercel-lambda/default-splits
+            Assign:
+              splits: "{% $parse($states.result.Parameter.Value) %}"
+              sharedUpdateTag: "{% $floor($millis() / 1000) %}"
+            Output: {}
+            Next: RunSplits
+
+          # Serial Map (MaxConcurrency: 1) over the fixed splits list — NOT
+          # a parallel fan-out. Today's default splits list has exactly one
+          # entry (see DefaultSplitsJson's Description), so this degenerates
+          # to a single iteration in practice — kept as a genuine Map (not
+          # simplified away) so the mechanism is identical to Okta's and a
+          # future multi-entry split (if growth ever requires one) is a
+          # pure SSM-value change, no template change. $sharedUpdateTag (an
+          # OUTER-scope variable, assigned above, before this Map starts)
+          # is readable from every iteration's ItemSelector below — see
+          # ResolveSplits/GetDefaultSplits's own comment for why this is
+          # the correct mechanism here, not a per-iteration Assign
+          # carry-forward.
+          RunSplits:
+            Type: Map
+            Items: "{% $splits %}"
+            ItemSelector:
+              splitIndex: "{% $states.context.Map.Item.Index %}"
+              steps: "{% $states.context.Map.Item.Value.steps %}"
+              updateTag: "{% $sharedUpdateTag %}"
+            MaxConcurrency: 1
+            Output:
+              status: SUCCEEDED
+              updateTag: "{% $sharedUpdateTag %}"
+              splitsCompleted: "{% $count($splits) %}"
+            ItemProcessor:
+              ProcessorConfig:
+                Mode: INLINE
+              StartAt: RunOneSplit
+              States:
+                # Synchronous nested execution (startExecution.sync:2 — the
+                # ":2" suffix returns JSON Output, not a string-escaped
+                # blob). This call BLOCKS until the nested
+                # cartography-vercel-lambda-sync execution finishes, which,
+                # combined with MaxConcurrency: 1 above, is what makes the
+                # whole splits list run strictly in sequence.
+                RunOneSplit:
+                  Type: Task
+                  Resource: arn:aws:states:::states:startExecution.sync:2
+                  Arguments:
+                    StateMachineArn: "${SyncStateMachineArn}"
+                    # Execution name must be unique per invocation — Step
+                    # Functions rejects a duplicate name on the same state
+                    # machine within its execution-history retention
+                    # window. $states.context here refers to the
+                    # ORCHESTRATOR's own execution context (this Task runs
+                    # AS a state of the orchestrator's own state machine),
+                    # so $states.context.Execution.Name is the
+                    # orchestrator's own run ID. Only the first
+                    # hyphen-delimited segment is used so the console stays
+                    # scannable at a glance — same convention
+                    # ../okta-lambda-loader/template.yaml's orchestrator
+                    # uses for its own nested execution names.
+                    Name: |-
+                      {%
+                        "vercel-orch-"
+                        & $split($states.context.Execution.Name, "-")[0]
+                        & "-"
+                        & $string($states.input.splitIndex)
+                        & "-"
+                        & $string($millis())
+                      %}
+                    Input:
+                      steps: "{% $states.input.steps %}"
+                      # Every split uses the SAME tag, computed once by the
+                      # orchestrator's ResolveSplits/GetDefaultSplits
+                      # BEFORE this Map started (an outer-scope variable,
+                      # readable from every iteration's ItemSelector).
+                      update_tag: "{% $states.input.updateTag %}"
+                  # Retry ONLY on Step-Functions-service-level failures for
+                  # STARTING the nested execution (throttling, transient
+                  # API errors) — NOT on the nested execution's own
+                  # reported failure, which already propagates as a Step
+                  # Functions execution FAILED status (via
+                  # cartography-vercel-lambda-sync's SyncFailed Fail state)
+                  # and is caught below instead.
+                  Retry:
+                    - ErrorEquals:
+                        - StepFunctions.ExecutionLimitExceeded
+                        - StepFunctions.ServiceException
+                      IntervalSeconds: 2
+                      MaxAttempts: 3
+                      BackoffRate: 2
+                  Catch:
+                    - ErrorEquals: ["States.ALL"]
+                      Next: SplitFailed
+                      Assign:
+                        catchError: "{% $states.errorOutput %}"
+                  # Pass this state's OWN input through unchanged (NOT
+                  # Output: {}) — SplitComplete below needs
+                  # $states.input.splitIndex, which comes from THIS state's
+                  # input (set by the outer Map's ItemSelector), not from
+                  # anything startExecution.sync:2 itself returned. Same
+                  # fix ../okta-lambda-loader/template.yaml's RunOneSplit
+                  # documents discovering the hard way (a live execution
+                  # failure with States.QueryEvaluationError) when this was
+                  # originally `Output: {}`.
+                  Output: "{% $states.input %}"
+                  Next: SplitComplete
+
+                SplitComplete:
+                  Type: Pass
+                  Output:
+                    splitIndex: "{% $states.input.splitIndex %}"
+                    status: SUCCEEDED
+                  End: true
+
+                # A genuine Fail state, not a Pass — propagates up through
+                # the Map and aborts the whole orchestrator execution. Same
+                # rationale as ../okta-lambda-loader/template.yaml's
+                # SplitFailed.
+                SplitFailed:
+                  Type: Fail
+                  Error: VercelSplitFailed
+                  Cause: "{% $string($catchError) %}"
+            End: true
+
+  # ── Runtime-adjustable schedule (SSM) ────────────────────────────────────
+  # The EventBridge ScheduleExpression is resolved from this SSM parameter
+  # at deploy time via a {{resolve:ssm:...}} dynamic reference — same
+  # pattern every other scheduler stack in this repo uses (e.g.
+  # ../okta-lambda-loader/template.yaml's OktaLambdaScheduleParameter).
+  #   aws ssm put-parameter --overwrite \
+  #     --name /cartography/vercel-lambda/schedule --value 'cron(0 7 * * ? *)'
+  #   cd vercel-lambda-loader && sam build && sam deploy
+  # NOTE: CloudFormation only sets this value on stack *create*; a later
+  # `sam deploy` will NOT overwrite an out-of-band change unless
+  # ScheduleDefault itself changed.
+  VercelLambdaScheduleParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /cartography/vercel-lambda/schedule
+      Type: String
+      Value: !Ref ScheduleDefault
+      Description: >
+        EventBridge schedule expression for the daily
+        cartography-vercel-lambda-orchestrator run. Resolved into the
+        schedule at deploy time. The schedule itself is created DISABLED
+        (see CartographyVercelLambdaSchedule).
+      Tags:
+        Project: cartography
+
+  # ── IAM role for EventBridge Scheduler ───────────────────────────────────
+  VercelLambdaSchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cartography-vercel-lambda-scheduler-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StartOrchestratorStateMachine
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref CartographyVercelLambdaOrchestrator
+      Tags:
+        - Key: Project
+          Value: cartography
+
+  # ── EventBridge Scheduler ────────────────────────────────────────────────
+  # Triggers cartography-vercel-lambda-orchestrator daily with input {}
+  # (the full default splits list from SSM) — same pattern
+  # ../okta-lambda-loader/template.yaml's CartographyOktaLambdaSchedule
+  # uses (targets the ORCHESTRATOR, not the sync state machine directly).
+  #
+  # Created DISABLED. Flip State: ENABLED to run the sync nightly.
+  CartographyVercelLambdaSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: cartography-vercel-lambda-daily
+      Description: >
+        Triggers the daily cartography-vercel-lambda-orchestrator run (full
+        default splits list). Created DISABLED.
+      State: DISABLED
+      ScheduleExpression: !Sub "{{resolve:ssm:${VercelLambdaScheduleParameter}}}"
+      ScheduleExpressionTimezone: UTC
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !Ref CartographyVercelLambdaOrchestrator
+        RoleArn: !GetAtt VercelLambdaSchedulerRole.Arn
+        Input: "{}"
+
+Outputs:
+  StateMachineArn:
+    Value: !Ref CartographyVercelLambdaStateMachine
+    Description: ARN of the single-task cartography-vercel-lambda-sync Step Functions state machine
+  OrchestratorStateMachineArn:
+    Value: !Ref CartographyVercelLambdaOrchestrator
+    Description: ARN of the cartography-vercel-lambda-orchestrator Step Functions state machine
+  FunctionArn:
+    Value: !GetAtt VercelLoaderFunction.Arn
+    Description: ARN of the Vercel Lambda loader function
+  LambdaLogGroup:
+    Value: !Ref LambdaLogGroup
+    Description: CloudWatch log group for Lambda execution logs
+  StateMachineLogGroup:
+    Value: !Ref StateMachineLogGroup
+    Description: CloudWatch log group for cartography-vercel-lambda-sync execution logs
+  OrchestratorStateMachineLogGroup:
+    Value: !Ref OrchestratorStateMachineLogGroup
+    Description: CloudWatch log group for cartography-vercel-lambda-orchestrator execution logs
+  ScheduleName:
+    Value: !Ref CartographyVercelLambdaSchedule
+    Description: EventBridge schedule name for the daily sync run (created DISABLED)

@@ -1,0 +1,771 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Cartography - Cloudflare Lambda Loader. Two Step Functions state machines +
+  one Lambda, mirroring ../okta-lambda-loader's and
+  ../vercel-lambda-loader's sync/orchestrator split.
+  cartography-cloudflare-lambda-sync is a single-task wrapper: one execution
+  = one Lambda invocation, given an explicit step list.
+  cartography-cloudflare-lambda-orchestrator drives a FIXED sequence of such
+  executions (one per split, from SSM), threading one shared update_tag
+  through all of them. An EventBridge schedule triggers the orchestrator
+  daily. Measured timing (see src/handler.py's docstring) shows the whole
+  Cloudflare sync for a small org fits comfortably in one invocation
+  (~25-85s, vs. Lambda's 900s cap) — so the default splits list has
+  exactly ONE entry, same shape
+  as ../vercel-lambda-loader/template.yaml.
+
+Parameters:
+  LambdaMemoryMb:
+    Type: Number
+    Default: 512
+    Description: >
+      The Cloudflare sync is network/API-bound (paginated HTTP calls per
+      submodule), not memory-heavy. 512MB is a starting point, matching
+      ../vercel-lambda-loader/template.yaml's own default for a
+      similarly-shaped workload.
+
+  LambdaTimeoutSeconds:
+    Type: Number
+    Default: 900
+    MaxValue: 900
+    Description: >
+      900s (15 min) is Lambda's hard ceiling — cannot be raised. Kept
+      explicit so every invocation always gets the Lambda's full available
+      runway. See src/handler.py's docstring — the slowest measured run
+      (~85s) used under 10% of this budget.
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC that Neo4j and the loaders run in.
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Private subnet with outbound internet (NAT), same VPC as Neo4j.
+
+  DefaultSplitsJson:
+    Type: String
+    Default: >-
+      [
+        {"steps": ["accounts","roles","members","dnsrecord_migration",
+          "zones","dnsrecords","r2buckets","workerscripts","workerroutes",
+          "rulesets"]}
+      ]
+    Description: >
+      Deploy-time seed for the SSM parameter
+      /cartography/cloudflare-lambda/default-splits — a JSON array of
+      FIXED, pre-defined splits a normal (no-input) orchestrator run
+      executes IN ORDER, one cartography-cloudflare-lambda-sync nested
+      execution per split — same shape as
+      ../okta-lambda-loader/template.yaml's and
+      ../vercel-lambda-loader/template.yaml's DefaultSplitsJson. Measured
+      timing (see src/handler.py's docstring) shows the WHOLE Cloudflare
+      sync for a small org comfortably fits in a single Lambda invocation
+      — so this default has exactly ONE split containing every step from
+      handler.py's DEFAULT_STEPS, in start_cloudflare_ingestion()'s own
+      call order. If this org's Cloudflare footprint ever grows enough to
+      require splitting, add more {"steps": [...]} entries here — no
+      template or handler change needed. Update via `aws ssm put-parameter
+      --overwrite` — no redeploy needed (CloudFormation only seeds this
+      value on stack create).
+
+  ScheduleDefault:
+    Type: String
+    Default: "cron(0 0 * * ? *)"
+    Description: >
+      Deploy-time seed for the SSM parameter
+      /cartography/cloudflare-lambda/schedule, which drives the EventBridge
+      schedule that triggers cartography-cloudflare-lambda-orchestrator
+      daily. Default 00:00 UTC; each loader has its own default slot so
+      runs don't overlap. Keep this before the ontology loader (10:00
+      UTC).
+
+Resources:
+
+  # ── Security group ─────────────────────────────────────────────────────
+  # A dedicated SG (not a reuse of cartography-lambda-loader-sg,
+  # cartography-okta-lambda-loader-sg, or
+  # cartography-vercel-lambda-loader-sg) so this stack can be torn down
+  # without touching a resource any of those depend on — same reasoning
+  # every other Lambda loader's template.yaml in this repo documents for
+  # its own SG.
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: cartography-cloudflare-lambda-loader-sg
+      GroupDescription: Cartography Cloudflare Lambda loader - outbound only
+      VpcId: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value: cartography-cloudflare-lambda-loader-sg
+        - Key: Project
+          Value: cartography
+
+  LambdaEgressHttps:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref LambdaSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: 0.0.0.0/0
+      Description: Outbound HTTPS (Cloudflare API, SSM GetParameter)
+
+  LambdaEgressNeo4jBolt:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref LambdaSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8443
+      ToPort: 8443
+      DestinationSecurityGroupId: "{{resolve:ssm:/cartography/sg/neo4j}}"
+      Description: Bolt 8443 to Neo4j
+
+  # Allow this Lambda's ENI in on the Neo4j SG. Additive only: does not
+  # modify or replace any other loader's existing rule on
+  # cartography-neo4j-sg — same reasoning every other Lambda loader's
+  # template.yaml documents for its own ingress rule.
+  Neo4jIngressFromCloudflareLambda:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: "{{resolve:ssm:/cartography/sg/neo4j}}"
+      IpProtocol: tcp
+      FromPort: 8443
+      ToPort: 8443
+      SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      Description: Bolt 8443 from Cartography Cloudflare Lambda loader
+
+  # ── IAM role for the Lambda function ──────────────────────────────────
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cartography-cloudflare-lambda-loader-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # Required for a Lambda attached to a VPC to create/manage its ENIs.
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: ReadNeo4jPassword
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cartography/neo4j/password"
+        # Read the Cloudflare API token at invoke time (with decryption) —
+        # see handler.py's module docstring / _get_cloudflare_token for why
+        # this is fetched at runtime rather than baked into the Lambda's
+        # environment variables.
+        - PolicyName: ReadCloudflareToken
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cartography/cloudflare/token"
+      Tags:
+        - Key: Project
+          Value: cartography
+
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /cartography/cloudflare-lambda-loader
+      RetentionInDays: 30
+
+  # ── The Lambda function ───────────────────────────────────────────────
+  CloudflareLoaderFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: cartography-cloudflare-lambda-loader
+      Handler: handler.handler
+      Runtime: python3.13
+      Architectures: [x86_64]
+      CodeUri: .
+      MemorySize: !Ref LambdaMemoryMb
+      Timeout: !Ref LambdaTimeoutSeconds
+      Role: !GetAtt LambdaExecutionRole.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref SubnetId
+      LoggingConfig:
+        LogGroup: !Ref LambdaLogGroup
+      Environment:
+        Variables:
+          NEO4J_URI: "bolt://{{resolve:ssm:/cartography/neo4j/private-ip}}:8443"
+          NEO4J_PASSWORD_SSM_PARAM: /cartography/neo4j/password
+          NEO4J_MAX_CONNECTION_LIFETIME: "200"
+          # Name of the SSM parameter holding the Cloudflare API token — NOT
+          # the token itself. See ReadCloudflareToken policy above and
+          # handler.py's _get_cloudflare_token(). Unlike Vercel (which also
+          # needs a team-id-shaped parameter), Cloudflare's module takes no
+          # account identifier — a single token walks every account it can
+          # see, so this is the only Cloudflare-specific config value this
+          # Lambda needs.
+          CLOUDFLARE_TOKEN_SSM_PARAM: /cartography/cloudflare/token
+      Tags:
+        Project: cartography
+
+  # ── IAM role for Step Functions (both state machines) ──────────────────
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cartography-cloudflare-lambda-statemachine-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeLoaderLambda
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt CloudflareLoaderFunction.Arn
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: "*"
+      Tags:
+        - Key: Project
+          Value: cartography
+
+  StateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /cartography/scheduler/cloudflare-lambda-loader
+      RetentionInDays: 30
+
+  # ── Step Functions state machine #1: single-task sync wrapper ──────────
+  # One execution = exactly ONE Lambda invocation. Does NOT loop, does NOT
+  # decide what steps to run — it is handed an explicit step list (and, for
+  # a continuation call, an update_tag) and simply invokes the Lambda once
+  # with that payload. Mirrors ../vercel-lambda-loader's
+  # cartography-vercel-lambda-sync exactly.
+  #
+  # Input: {"steps": [...], "update_tag"?: <int>}. "update_tag" is
+  # OPTIONAL — omit it to start a brand-new run (the Lambda generates a
+  # fresh tag and reports it back in the output); pass a prior run's
+  # updateTag to continue that same run's data under its existing tag.
+  CartographyCloudflareLambdaStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: cartography-cloudflare-lambda-sync
+      RoleArn: !GetAtt StateMachineRole.Arn
+      LoggingConfiguration:
+        Level: ERROR
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StateMachineLogGroup.Arn
+      DefinitionSubstitutions:
+        LoaderFunctionArn: !GetAtt CloudflareLoaderFunction.Arn
+      Definition:
+        QueryLanguage: JSONata
+        Comment: >
+          Single-task wrapper around the Cloudflare Lambda loader. One
+          execution = one Lambda invocation with the given "steps" (and
+          optional "update_tag"). No looping, no step-grouping decisions
+          made here — see cartography-cloudflare-lambda-orchestrator for
+          that. A FAILED invocation ends this execution with AWS-level
+          status FAILED.
+        StartAt: InvokeLoader
+        States:
+
+          InvokeLoader:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Arguments:
+              FunctionName: "${LoaderFunctionArn}"
+              Payload:
+                steps: "{% $states.input.steps %}"
+                update_tag: "{% $exists($states.input.update_tag) ? $states.input.update_tag : null %}"
+            # Retry ONLY on Lambda-service-level failures (throttling,
+            # transient invoke errors) — NOT on the handler's own reported
+            # failure (a 200 response body with status:"FAILED") and NOT on
+            # a timeout. Same Retry/Catch shape as every other Lambda
+            # loader's InvokeLoader state in this repo.
+            Retry:
+              - ErrorEquals:
+                  - Lambda.ServiceException
+                  - Lambda.AWSLambdaException
+                  - Lambda.SdkClientException
+                  - Lambda.TooManyRequestsException
+                IntervalSeconds: 2
+                MaxAttempts: 2
+                BackoffRate: 2
+            Catch:
+              - ErrorEquals: ["States.ALL"]
+                Next: SyncFailed
+                Assign:
+                  catchError: "{% $states.errorOutput %}"
+            Assign:
+              invokeResult: "{% $states.result.Payload %}"
+            Output: {}
+            Next: EvalInvokeResult
+
+          EvalInvokeResult:
+            Type: Choice
+            Choices:
+              - Condition: "{% $invokeResult.status = 'SUCCEEDED' %}"
+                Next: SyncComplete
+            Default: SyncFailed
+
+          SyncComplete:
+            Type: Pass
+            Output:
+              status: SUCCEEDED
+              updateTag: "{% $invokeResult.updateTag %}"
+              completed: "{% $invokeResult.completed %}"
+              durationSeconds: "{% $invokeResult.durationSeconds %}"
+            End: true
+
+          # A genuine Fail state, not a Pass — this state machine has no
+          # Map/fan-out (one execution = one Lambda invocation), so there
+          # is no "keep going for other items" concern a Pass state would
+          # protect. Same rationale every other Lambda loader's SyncFailed
+          # state in this repo documents in full.
+          SyncFailed:
+            Type: Fail
+            Error: CloudflareSyncFailed
+            Cause: "{% $exists($invokeResult) ? $invokeResult.error : $string($catchError) %}"
+
+  # Add SSM read permission for the default-splits parameter to the same
+  # role used for Lambda invocation above — same pattern every other Lambda
+  # loader's StateMachineReadDefaultSplits uses.
+  StateMachineReadDefaultSplits:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Roles:
+        - !Ref StateMachineRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: ssm:GetParameter
+            Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cartography/cloudflare-lambda/default-splits"
+
+  # Nested-execution permissions so the orchestrator can call
+  # cartography-cloudflare-lambda-sync synchronously (startExecution.sync:2)
+  # — same permission shape every other Lambda loader's orchestrator uses
+  # for its own nested calls.
+  StateMachineInvokeNestedSync:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Roles:
+        - !Ref StateMachineRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: states:StartExecution
+            Resource: !Ref CartographyCloudflareLambdaStateMachine
+          - Effect: Allow
+            Action:
+              - states:DescribeExecution
+              - states:StopExecution
+            Resource: !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:cartography-cloudflare-lambda-sync:*"
+          - Effect: Allow
+            Action:
+              - events:PutTargets
+              - events:PutRule
+              - events:DescribeRule
+            Resource: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsForStepFunctionsExecutionRule"
+
+  # ── Runtime-adjustable default splits list (SSM) ────────────────────────
+  # JSON array of {"steps": [...]} splits a normal (no-input) orchestrator
+  # run executes, IN ORDER, one cartography-cloudflare-lambda-sync nested
+  # execution per entry. NOTE: CloudFormation only sets this value on stack
+  # *create*; a later `sam deploy` will NOT overwrite an out-of-band edit —
+  # same pattern as every other Lambda loader's default-splits parameter.
+  #   aws ssm put-parameter --overwrite \
+  #     --name /cartography/cloudflare-lambda/default-splits --value '[...]'
+  DefaultSplitsParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /cartography/cloudflare-lambda/default-splits
+      Type: String
+      Tier: Standard
+      Value: !Ref DefaultSplitsJson
+      Description: >
+        JSON array of {"steps": [...]} splits, run in order, one
+        cartography-cloudflare-lambda-sync nested execution per entry. Read
+        at execution start by cartography-cloudflare-lambda-orchestrator
+        when no explicit "splits" override is given in the execution input.
+        Must stay in sync with handler.py's DEFAULT_STEPS (today: one split
+        containing every step — see DefaultSplitsJson's Description above
+        for why this doesn't need multiple splits).
+      Tags:
+        Project: cartography
+
+  # ── Step Functions state machine #2: fixed-split orchestrator ──────────
+  # No EventBridge schedule directly on this state machine's own
+  # definition — the schedule (CartographyCloudflareLambdaSchedule, below)
+  # targets THIS orchestrator, not the sync state machine directly, same as
+  # every other Lambda loader's schedule in this repo.
+  #
+  # Drives a FIXED, pre-defined SEQUENCE of
+  # cartography-cloudflare-lambda-sync nested executions — one per split in
+  # the splits list (from SSM, or an explicit {"splits": [...]} override) —
+  # run strictly IN ORDER (a Map with MaxConcurrency: 1, which forces serial
+  # execution; today's default splits list has exactly one entry, so this
+  # is a degenerate one-iteration loop in practice, but the mechanism is
+  # identical to Okta's/Vercel's in case a future split ever adds a second
+  # entry).
+  #
+  # ANY nested execution failing (cartography-cloudflare-lambda-sync's own
+  # Fail state, see that state machine's SyncFailed) propagates up and
+  # stops this orchestrator's execution immediately — no partial-success
+  # continuation to later splits.
+  #
+  # Input options:
+  #   {}                       — full default run (reads the ordered
+  #                               splits list from
+  #                               /cartography/cloudflare-lambda/default-splits)
+  #   {"splits": [{"steps": [...]}, ...]}
+  #                             — run exactly this ordered splits list
+  #                               instead (for a manual/debug run).
+  CartographyCloudflareLambdaOrchestratorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cartography-cloudflare-lambda-orchestrator-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ReadDefaultSplits
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cartography/cloudflare-lambda/default-splits"
+        - PolicyName: InvokeNestedSync
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref CartographyCloudflareLambdaStateMachine
+              - Effect: Allow
+                Action:
+                  - states:DescribeExecution
+                  - states:StopExecution
+                Resource: !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:cartography-cloudflare-lambda-sync:*"
+              - Effect: Allow
+                Action:
+                  - events:PutTargets
+                  - events:PutRule
+                  - events:DescribeRule
+                Resource: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsForStepFunctionsExecutionRule"
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: "*"
+      Tags:
+        - Key: Project
+          Value: cartography
+
+  OrchestratorStateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /cartography/scheduler/cloudflare-lambda-orchestrator
+      RetentionInDays: 30
+
+  CartographyCloudflareLambdaOrchestrator:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: cartography-cloudflare-lambda-orchestrator
+      RoleArn: !GetAtt CartographyCloudflareLambdaOrchestratorRole.Arn
+      LoggingConfiguration:
+        Level: ERROR
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt OrchestratorStateMachineLogGroup.Arn
+      DefinitionSubstitutions:
+        SyncStateMachineArn: !Ref CartographyCloudflareLambdaStateMachine
+      Definition:
+        QueryLanguage: JSONata
+        Comment: >
+          Drives a FIXED, pre-defined sequence of
+          cartography-cloudflare-lambda-sync nested executions, one per
+          split (from SSM or an explicit {"splits": [...]} override),
+          strictly in order, threading one shared update_tag through all of
+          them. Any nested execution failing stops the whole orchestrator
+          run immediately. See this template's surrounding comments for
+          the full design.
+        StartAt: ResolveSplits
+        States:
+
+          # An explicit {"splits": [...]} input always wins; {} (or any
+          # input with no "splits" key) reads the default list from SSM.
+          #
+          # ALSO generates the one shared update_tag HERE, up front, before
+          # any split runs — NOT by threading a Step-Functions variable
+          # forward from one Map iteration's result to the next. Same
+          # reasoning every other Lambda loader's orchestrator documents in
+          # full: Step Functions' own docs are explicit that a variable
+          # assigned inside one Map iteration is invisible to the next
+          # iteration and goes out of scope once the Map completes.
+          # Generating the tag before the Map, as an outer-scope variable
+          # every iteration can read, sidesteps that limitation entirely.
+          # $floor($millis() / 1000) mirrors handler.py's own
+          # int(time.time()) exactly (epoch seconds, not millis).
+          ResolveSplits:
+            Type: Choice
+            Choices:
+              - Condition: "{% $exists($states.input.splits) and $count($states.input.splits) > 0 %}"
+                Assign:
+                  splits: "{% $states.input.splits %}"
+                  sharedUpdateTag: "{% $floor($millis() / 1000) %}"
+                Next: RunSplits
+            Default: GetDefaultSplits
+
+          GetDefaultSplits:
+            Type: Task
+            Resource: arn:aws:states:::aws-sdk:ssm:getParameter
+            Arguments:
+              Name: /cartography/cloudflare-lambda/default-splits
+            Assign:
+              splits: "{% $parse($states.result.Parameter.Value) %}"
+              sharedUpdateTag: "{% $floor($millis() / 1000) %}"
+            Output: {}
+            Next: RunSplits
+
+          # Serial Map (MaxConcurrency: 1) over the fixed splits list — NOT
+          # a parallel fan-out. Today's default splits list has exactly one
+          # entry (see DefaultSplitsJson's Description), so this degenerates
+          # to a single iteration in practice — kept as a genuine Map (not
+          # simplified away) so the mechanism is identical to Okta's/
+          # Vercel's and a future multi-entry split (if growth ever
+          # requires one) is a pure SSM-value change, no template change.
+          RunSplits:
+            Type: Map
+            Items: "{% $splits %}"
+            ItemSelector:
+              splitIndex: "{% $states.context.Map.Item.Index %}"
+              steps: "{% $states.context.Map.Item.Value.steps %}"
+              updateTag: "{% $sharedUpdateTag %}"
+            MaxConcurrency: 1
+            Output:
+              status: SUCCEEDED
+              updateTag: "{% $sharedUpdateTag %}"
+              splitsCompleted: "{% $count($splits) %}"
+            ItemProcessor:
+              ProcessorConfig:
+                Mode: INLINE
+              StartAt: RunOneSplit
+              States:
+                # Synchronous nested execution (startExecution.sync:2 — the
+                # ":2" suffix returns JSON Output, not a string-escaped
+                # blob). This call BLOCKS until the nested
+                # cartography-cloudflare-lambda-sync execution finishes,
+                # which, combined with MaxConcurrency: 1 above, is what
+                # makes the whole splits list run strictly in sequence.
+                RunOneSplit:
+                  Type: Task
+                  Resource: arn:aws:states:::states:startExecution.sync:2
+                  Arguments:
+                    StateMachineArn: "${SyncStateMachineArn}"
+                    # Execution name must be unique per invocation — Step
+                    # Functions rejects a duplicate name on the same state
+                    # machine within its execution-history retention
+                    # window. $states.context here refers to the
+                    # ORCHESTRATOR's own execution context, so
+                    # $states.context.Execution.Name is the orchestrator's
+                    # own run ID. Only the first hyphen-delimited segment is
+                    # used so the console stays scannable at a glance — same
+                    # convention every other Lambda loader's orchestrator
+                    # uses for its own nested execution names.
+                    Name: |-
+                      {%
+                        "cloudflare-orch-"
+                        & $split($states.context.Execution.Name, "-")[0]
+                        & "-"
+                        & $string($states.input.splitIndex)
+                        & "-"
+                        & $string($millis())
+                      %}
+                    Input:
+                      steps: "{% $states.input.steps %}"
+                      # Every split uses the SAME tag, computed once by the
+                      # orchestrator's ResolveSplits/GetDefaultSplits BEFORE
+                      # this Map started.
+                      update_tag: "{% $states.input.updateTag %}"
+                  # Retry ONLY on Step-Functions-service-level failures for
+                  # STARTING the nested execution (throttling, transient
+                  # API errors) — NOT on the nested execution's own reported
+                  # failure, which already propagates as a Step Functions
+                  # execution FAILED status (via
+                  # cartography-cloudflare-lambda-sync's SyncFailed Fail
+                  # state) and is caught below instead.
+                  Retry:
+                    - ErrorEquals:
+                        - StepFunctions.ExecutionLimitExceeded
+                        - StepFunctions.ServiceException
+                      IntervalSeconds: 2
+                      MaxAttempts: 3
+                      BackoffRate: 2
+                  Catch:
+                    - ErrorEquals: ["States.ALL"]
+                      Next: SplitFailed
+                      Assign:
+                        catchError: "{% $states.errorOutput %}"
+                  # Pass this state's OWN input through unchanged (NOT
+                  # Output: {}) — SplitComplete below needs
+                  # $states.input.splitIndex, which comes from THIS state's
+                  # input (set by the outer Map's ItemSelector), not from
+                  # anything startExecution.sync:2 itself returned. Same
+                  # fix every other Lambda loader's orchestrator in this
+                  # repo documents discovering the hard way.
+                  Output: "{% $states.input %}"
+                  Next: SplitComplete
+
+                SplitComplete:
+                  Type: Pass
+                  Output:
+                    splitIndex: "{% $states.input.splitIndex %}"
+                    status: SUCCEEDED
+                  End: true
+
+                # A genuine Fail state, not a Pass — propagates up through
+                # the Map and aborts the whole orchestrator execution. Same
+                # rationale as every other Lambda loader's SplitFailed.
+                SplitFailed:
+                  Type: Fail
+                  Error: CloudflareSplitFailed
+                  Cause: "{% $string($catchError) %}"
+            End: true
+
+  # ── Runtime-adjustable schedule (SSM) ────────────────────────────────────
+  # The EventBridge ScheduleExpression is resolved from this SSM parameter
+  # at deploy time via a {{resolve:ssm:...}} dynamic reference — same
+  # pattern every other scheduler stack in this repo uses.
+  #   aws ssm put-parameter --overwrite \
+  #     --name /cartography/cloudflare-lambda/schedule --value 'cron(0 1 * * ? *)'
+  #   cd cloudflare-lambda-loader && sam build && sam deploy
+  # NOTE: CloudFormation only sets this value on stack *create*; a later
+  # `sam deploy` will NOT overwrite an out-of-band change unless
+  # ScheduleDefault itself changed.
+  CloudflareLambdaScheduleParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /cartography/cloudflare-lambda/schedule
+      Type: String
+      Value: !Ref ScheduleDefault
+      Description: >
+        EventBridge schedule expression for the daily
+        cartography-cloudflare-lambda-orchestrator run. Resolved into the
+        schedule at deploy time (see CartographyCloudflareLambdaSchedule).
+      Tags:
+        Project: cartography
+
+  # ── IAM role for EventBridge Scheduler ───────────────────────────────────
+  CloudflareLambdaSchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cartography-cloudflare-lambda-scheduler-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StartOrchestratorStateMachine
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref CartographyCloudflareLambdaOrchestrator
+      Tags:
+        - Key: Project
+          Value: cartography
+
+  # ── EventBridge Scheduler ────────────────────────────────────────────────
+  # Triggers cartography-cloudflare-lambda-orchestrator daily with input {}
+  # (the full default splits list from SSM) — same pattern every other
+  # Lambda loader's schedule in this repo uses (targets the ORCHESTRATOR,
+  # not the sync state machine directly).
+  CartographyCloudflareLambdaSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: cartography-cloudflare-lambda-daily
+      Description: >
+        Triggers the daily cartography-cloudflare-lambda-orchestrator run
+        (full default splits list).
+      State: ENABLED
+      ScheduleExpression: !Sub "{{resolve:ssm:${CloudflareLambdaScheduleParameter}}}"
+      ScheduleExpressionTimezone: UTC
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !Ref CartographyCloudflareLambdaOrchestrator
+        RoleArn: !GetAtt CloudflareLambdaSchedulerRole.Arn
+        Input: "{}"
+
+Outputs:
+  StateMachineArn:
+    Value: !Ref CartographyCloudflareLambdaStateMachine
+    Description: ARN of the single-task cartography-cloudflare-lambda-sync Step Functions state machine
+  OrchestratorStateMachineArn:
+    Value: !Ref CartographyCloudflareLambdaOrchestrator
+    Description: ARN of the cartography-cloudflare-lambda-orchestrator Step Functions state machine
+  FunctionArn:
+    Value: !GetAtt CloudflareLoaderFunction.Arn
+    Description: ARN of the Cloudflare Lambda loader function
+  LambdaLogGroup:
+    Value: !Ref LambdaLogGroup
+    Description: CloudWatch log group for Lambda execution logs
+  StateMachineLogGroup:
+    Value: !Ref StateMachineLogGroup
+    Description: CloudWatch log group for cartography-cloudflare-lambda-sync execution logs
+  OrchestratorStateMachineLogGroup:
+    Value: !Ref OrchestratorStateMachineLogGroup
+    Description: CloudWatch log group for cartography-cloudflare-lambda-orchestrator execution logs
+  ScheduleName:
+    Value: !Ref CartographyCloudflareLambdaSchedule
+    Description: EventBridge schedule name for the daily sync run (created DISABLED)

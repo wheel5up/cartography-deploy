@@ -1,0 +1,6 @@
+[
+  {"org_id": "123456789012", "name": "example.com"},
+  {"org_id": "234567890123", "name": "example.org/big-project", "include_projects": ["big-project"]},
+  {"org_id": "234567890123", "name": "example.org/batch-0", "exclude_projects": ["big-project"], "project_batch_index": 0, "project_batch_count": 2},
+  {"org_id": "234567890123", "name": "example.org/batch-1", "exclude_projects": ["big-project"], "project_batch_index": 1, "project_batch_count": 2}
+]

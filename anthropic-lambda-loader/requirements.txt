@@ -1,0 +1,14 @@
+# Runtime deps for the Anthropic Lambda loader. NOT `pip install cartography`;
+# cartography's source is vendored by the Makefile from the pinned fork tag.
+#
+# Derived by walking every import reachable from cartography.intel.anthropic
+# (rc18): backoff, boto3/botocore, neo4j, requests, statsd, urllib3 (Retry,
+# imported directly by start_anthropic_ingestion). boto3 is needed even
+# though no AWS API is called for sync, because cartography/util.py imports
+# it at module level; the handler also uses it for SSM.
+boto3>=1.40.0
+neo4j>=6.0.0
+requests>=2.31.0
+urllib3>=2.0.0
+backoff>=2.1.2
+statsd>=4.0.0

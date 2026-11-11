@@ -1,0 +1,13 @@
+{
+  "111111111111": {"splits": [
+    {"exclude": ["inspector", "permission_relationships"]},
+    {"include": ["inspector"]},
+    {"include": ["permission_relationships"]}
+  ]},
+  "222222222222": {"splits": [
+    {"exclude": ["sagemaker", "inspector", "permission_relationships"]},
+    {"include": ["sagemaker"]},
+    {"include": ["inspector"]},
+    {"include": ["permission_relationships"]}
+  ]}
+}

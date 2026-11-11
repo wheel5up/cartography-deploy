@@ -1,0 +1,850 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Cartography - Okta Lambda Loader. Two Step Functions state machines + one
+  Lambda, mirroring ../lambda-loader's sync/orchestrator split for AWS.
+  cartography-okta-lambda-sync is a single-task wrapper: one execution =
+  exactly one Lambda invocation, given an explicit step list.
+  cartography-okta-lambda-orchestrator drives a FIXED, pre-defined sequence
+  of such executions (one per split, from SSM), threading one shared
+  update_tag through all of them. An EventBridge schedule triggers the
+  orchestrator daily — see CartographyOktaLambdaSchedule. See README.md for
+  the full design.
+
+Parameters:
+  LambdaMemoryMb:
+    Type: Number
+    Default: 512
+    Description: >
+      The Okta sync is network/API-bound (paginated HTTP calls + per-user
+      factor/role fetches), not memory-heavy. 512MB is a starting point —
+      Lambda also scales CPU with memory, so more memory can incidentally
+      mean faster wall time if any phase turns out to be CPU-bound (e.g.
+      JSON transform of a large user list).
+
+  LambdaTimeoutSeconds:
+    Type: Number
+    Default: 900
+    MaxValue: 900
+    Description: >
+      900s (15 min) is Lambda's hard ceiling — cannot be raised. Kept
+      explicit so every invocation always gets the Lambda's full available
+      runway. See README.md "Default splits" for why `applications` alone
+      needs splitting into multiple invocations even with a full 900s each.
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC that Neo4j and the loaders run in.
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Private subnet with outbound internet (NAT), same VPC as Neo4j.
+
+  DefaultSplitsJson:
+    Type: String
+    Default: >-
+      [
+        {"steps": ["organization","users","groups","user_types","factors","log_streams","coverage"]},
+        {"steps": ["applications:0:100"]},
+        {"steps": ["applications:100:200"]},
+        {"steps": ["applications:200:300"]},
+        {"steps": ["applications:300:400"]},
+        {"steps": ["applications:cleanup","origins","authenticators","awssaml"]},
+        {"steps": ["devices","network_zones","api_tokens","policies"]},
+        {"steps": ["sync_complete"]}
+      ]
+    Description: >
+      Deploy-time seed for the SSM parameter
+      /cartography/okta-lambda/default-splits — a JSON array of FIXED,
+      pre-defined splits a normal (no-input) orchestrator run executes IN
+      ORDER, one cartography-okta-lambda-sync nested execution per split.
+      Same pattern as ../lambda-loader/account-splits.json, adapted to
+      Okta's single-tenant shape (no per-account dimension — just an
+      ordered list of step groups). Each split's "steps" must stay in
+      cartography's own call order overall across the whole list (see
+      src/handler.py's module docstring) — specifically
+      "applications:cleanup" must come after every "applications:<n>:<m>"
+      batch, and "sync_complete" (writes the final ModuleSyncMetadata
+      "receipt" node, matching start_okta_ingestion()'s own last action —
+      see handler.py's "sync_complete" branch) must be the LAST split in
+      the list, in its own split by itself, so it only ever runs after
+      every other split has already succeeded — the orchestrator's
+      existing fail-fast behavior (any split failing stops the whole run)
+      is what guarantees this, no special-casing needed. The default
+      grouping and the four application batch boundaries (0/100/200/300/400)
+      were sized by hand for an org with about 370 apps — see README.md
+      "Default splits" and "Why fixed splits, not a runtime time-budget
+      loop". Update via `aws ssm put-parameter --overwrite` — no
+      redeploy needed (CloudFormation only seeds this value on stack
+      create).
+
+  ScheduleDefault:
+    Type: String
+    Default: "cron(0 3 * * ? *)"
+    Description: >
+      Deploy-time seed for the SSM parameter /cartography/okta-lambda/schedule,
+      which drives the EventBridge schedule that triggers
+      cartography-okta-lambda-orchestrator daily. Default 03:00 UTC; each
+      loader has its own default slot so runs don't overlap. To change the
+      live schedule: update the SSM parameter and redeploy (the
+      ScheduleExpression below is resolved from SSM at deploy time;
+      EventBridge cannot read SSM at trigger time) — same pattern as every
+      other scheduler stack in this repo.
+
+  OktaOrgId:
+    Type: String
+    Description: >
+      Okta org subdomain, e.g. "my-org" for my-org.okta.com.
+
+Resources:
+
+  # ── Security group ─────────────────────────────────────────────────────
+  # A dedicated SG (not a reuse of cartography-lambda-loader-sg) so this
+  # stack can be torn down without touching a resource another stack
+  # depends on — same reasoning ../lambda-loader/template.yaml uses for its
+  # own SG.
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: cartography-okta-lambda-loader-sg
+      GroupDescription: Cartography Okta Lambda loader - outbound only
+      VpcId: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value: cartography-okta-lambda-loader-sg
+        - Key: Project
+          Value: cartography
+
+  LambdaEgressHttps:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref LambdaSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: 0.0.0.0/0
+      Description: Outbound HTTPS (Okta API, SSM GetParameter)
+
+  LambdaEgressNeo4jBolt:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref LambdaSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8443
+      ToPort: 8443
+      DestinationSecurityGroupId: "{{resolve:ssm:/cartography/sg/neo4j}}"
+      Description: Bolt 8443 to Neo4j
+
+  # Allow this Lambda's ENI in on the Neo4j SG. Distinct from the EC2
+  # loader's rule (scoped to cartography-loader-sg) and the AWS Lambda
+  # loader's rule (scoped to cartography-lambda-loader-sg) — each
+  # consuming stack adds its own explicit allow rather than widening an
+  # existing one.
+  Neo4jIngressFromOktaLambda:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: "{{resolve:ssm:/cartography/sg/neo4j}}"
+      IpProtocol: tcp
+      FromPort: 8443
+      ToPort: 8443
+      SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      Description: Bolt 8443 from Cartography Okta Lambda loader
+
+  # ── IAM role for the Lambda function ──────────────────────────────────
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cartography-okta-lambda-loader-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # Required for a Lambda attached to a VPC to create/manage its ENIs.
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: ReadNeo4jPassword
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cartography/neo4j/password"
+        # Read the Okta API token at invoke time (with decryption) — see
+        # handler.py's module docstring for why this is fetched at runtime
+        # rather than baked into the Lambda's environment variables.
+        - PolicyName: ReadOktaToken
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cartography/okta/token"
+      Tags:
+        - Key: Project
+          Value: cartography
+
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /cartography/okta-lambda-loader
+      RetentionInDays: 30
+
+  # ── The Lambda function ───────────────────────────────────────────────
+  OktaLoaderFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: cartography-okta-lambda-loader
+      Handler: handler.handler
+      Runtime: python3.13
+      Architectures: [x86_64]
+      CodeUri: .
+      MemorySize: !Ref LambdaMemoryMb
+      Timeout: !Ref LambdaTimeoutSeconds
+      Role: !GetAtt LambdaExecutionRole.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref SubnetId
+      LoggingConfig:
+        LogGroup: !Ref LambdaLogGroup
+      Environment:
+        Variables:
+          NEO4J_URI: "bolt://{{resolve:ssm:/cartography/neo4j/private-ip}}:8443"
+          NEO4J_PASSWORD_SSM_PARAM: /cartography/neo4j/password
+          NEO4J_MAX_CONNECTION_LIFETIME: "200"
+          OKTA_ORG_ID: !Ref OktaOrgId
+          OKTA_BASE_DOMAIN: okta.com
+          # Name of the SSM parameter holding the Okta API token — NOT the
+          # token itself. See ReadOktaToken policy above and handler.py.
+          OKTA_TOKEN_SSM_PARAM: /cartography/okta/token
+          # Unset by default: set it only if your Okta groups use the AWS
+          # Account Federation SAML naming format. While unset, the handler
+          # skips "awssaml" to avoid an upstream crash — see handler.py's
+          # "awssaml" branch and README.md "`awssaml` is skipped unless
+          # `OKTA_SAML_ROLE_REGEX` is set".
+          # OKTA_SAML_ROLE_REGEX: ""
+      Tags:
+        Project: cartography
+
+  # ── IAM role for Step Functions (both state machines) ──────────────────
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cartography-okta-lambda-statemachine-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeLoaderLambda
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt OktaLoaderFunction.Arn
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: "*"
+      Tags:
+        - Key: Project
+          Value: cartography
+
+  StateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /cartography/scheduler/okta-lambda-loader
+      RetentionInDays: 30
+
+  # ── Step Functions state machine #1: single-task sync wrapper ──────────
+  # One execution = exactly ONE Lambda invocation. Does NOT loop, does NOT
+  # decide what steps to run — it is handed an explicit step list (and,
+  # for a continuation call, an update_tag) and simply invokes the Lambda
+  # once with that payload. This mirrors ../lambda-loader's own
+  # cartography-lambda-sync exactly (that one is also a thin single-task
+  # wrapper; cartography-lambda-orchestrator is the thing that drives many
+  # of them). Running this state machine directly (not via the
+  # orchestrator) is the easiest way to test one split in isolation — see
+  # README.md "Run manually".
+  #
+  # Input: {"steps": [...], "update_tag"?: <int>}. "update_tag" is
+  # OPTIONAL — omit it to start a brand-new run (the Lambda generates a
+  # fresh tag and reports it back in the output); pass a prior run's
+  # updateTag to continue that same run's data under its existing tag —
+  # see handler.py's module docstring "Why one shared update_tag" for why
+  # reusing the right tag matters for correctness, not just convenience.
+  CartographyOktaLambdaStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: cartography-okta-lambda-sync
+      RoleArn: !GetAtt StateMachineRole.Arn
+      LoggingConfiguration:
+        Level: ERROR
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StateMachineLogGroup.Arn
+      DefinitionSubstitutions:
+        LoaderFunctionArn: !GetAtt OktaLoaderFunction.Arn
+      Definition:
+        QueryLanguage: JSONata
+        Comment: >
+          Single-task wrapper around the Okta Lambda loader. One execution
+          = one Lambda invocation with the given "steps" (and optional
+          "update_tag"). No looping, no step-grouping decisions made here
+          — see cartography-okta-lambda-orchestrator for that. A FAILED
+          invocation ends this execution with AWS-level status FAILED.
+        StartAt: InvokeLoader
+        States:
+
+          InvokeLoader:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Arguments:
+              FunctionName: "${LoaderFunctionArn}"
+              Payload:
+                steps: "{% $states.input.steps %}"
+                update_tag: "{% $exists($states.input.update_tag) ? $states.input.update_tag : null %}"
+            # Retry ONLY on Lambda-service-level failures (throttling,
+            # transient invoke errors) — NOT on the handler's own reported
+            # failure (a 200 response body with status:"FAILED") and NOT on
+            # a timeout — a split already sized to fit in 900s timing out
+            # is a real failure worth surfacing immediately, not silently
+            # retrying. Same Retry/Catch shape as
+            # ../lambda-loader/template.yaml's InvokeLoader state.
+            Retry:
+              - ErrorEquals:
+                  - Lambda.ServiceException
+                  - Lambda.AWSLambdaException
+                  - Lambda.SdkClientException
+                  - Lambda.TooManyRequestsException
+                IntervalSeconds: 2
+                MaxAttempts: 2
+                BackoffRate: 2
+            Catch:
+              - ErrorEquals: ["States.ALL"]
+                Next: SyncFailed
+                Assign:
+                  catchError: "{% $states.errorOutput %}"
+            Assign:
+              invokeResult: "{% $states.result.Payload %}"
+            Output: {}
+            Next: EvalInvokeResult
+
+          EvalInvokeResult:
+            Type: Choice
+            Choices:
+              - Condition: "{% $invokeResult.status = 'SUCCEEDED' %}"
+                Next: SyncComplete
+            Default: SyncFailed
+
+          SyncComplete:
+            Type: Pass
+            Output:
+              status: SUCCEEDED
+              updateTag: "{% $invokeResult.updateTag %}"
+              completed: "{% $invokeResult.completed %}"
+              durationSeconds: "{% $invokeResult.durationSeconds %}"
+            End: true
+
+          # A genuine Fail state, not a Pass — this state machine has no
+          # Map/fan-out (one execution = one Lambda invocation), so there
+          # is no "keep going for other items" concern a Pass state would
+          # protect. A Fail state makes CloudWatch's ExecutionsFailed
+          # metric, EventBridge execution-status-change rules, and the
+          # console's red X work with no extra plumbing. A Pass-state-shaped
+          # "failures don't fail the execution" bug can hide an outage for
+          # months, which is why this is a Fail, not a Pass.
+          SyncFailed:
+            Type: Fail
+            Error: OktaSyncFailed
+            Cause: "{% $exists($invokeResult) ? $invokeResult.error : $string($catchError) %}"
+
+  # Add SSM read permission for the default-splits parameter to the same
+  # role used for Lambda invocation above (kept as a separate Policy block
+  # for readability, attached to the same StateMachineRole).
+  StateMachineReadDefaultSplits:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Roles:
+        - !Ref StateMachineRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: ssm:GetParameter
+            Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cartography/okta-lambda/default-splits"
+
+  # Nested-execution permissions so the orchestrator can call
+  # cartography-okta-lambda-sync synchronously (startExecution.sync:2) —
+  # same permission shape ../lambda-loader/template.yaml's own orchestrator
+  # uses for its own nested calls: states:StartExecution needs the STATE
+  # MACHINE arn; DescribeExecution/StopExecution need the EXECUTION arn
+  # (a different resource shape); the events:* triple lets Step Functions
+  # use EventBridge (instead of pure polling) to learn when the nested
+  # execution completes.
+  StateMachineInvokeNestedSync:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Roles:
+        - !Ref StateMachineRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: states:StartExecution
+            Resource: !Ref CartographyOktaLambdaStateMachine
+          - Effect: Allow
+            Action:
+              - states:DescribeExecution
+              - states:StopExecution
+            Resource: !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:cartography-okta-lambda-sync:*"
+          - Effect: Allow
+            Action:
+              - events:PutTargets
+              - events:PutRule
+              - events:DescribeRule
+            Resource: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsForStepFunctionsExecutionRule"
+
+  # ── Runtime-adjustable default splits list (SSM) ────────────────────────
+  # JSON array of {"steps": [...]} splits a normal (no-input) orchestrator
+  # run executes, IN ORDER, one cartography-okta-lambda-sync nested
+  # execution per entry. See DefaultSplitsJson's Description above for the
+  # full ordering rules and how the application batch boundaries were
+  # sized. NOTE: CloudFormation only sets this value on stack *create*; a
+  # later `sam deploy` will NOT overwrite an out-of-band edit — same
+  # pattern as ../lambda-loader/template.yaml's AccountSplitsParameter.
+  #   aws ssm put-parameter --overwrite \
+  #     --name /cartography/okta-lambda/default-splits --value '[...]'
+  DefaultSplitsParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /cartography/okta-lambda/default-splits
+      Type: String
+      Tier: Advanced
+      Value: !Ref DefaultSplitsJson
+      Description: >
+        JSON array of {"steps": [...]} splits, run in order, one
+        cartography-okta-lambda-sync nested execution per entry. Read at
+        execution start by cartography-okta-lambda-orchestrator when no
+        explicit "splits" override is given in the execution input.
+        Advanced tier (not Standard) for headroom if the applications
+        batch count grows and pushes the JSON payload past Standard's
+        4096-char limit.
+      Tags:
+        Project: cartography
+
+  # ── Step Functions state machine #2: fixed-split orchestrator ──────────
+  # The EventBridge schedule (CartographyOktaLambdaSchedule, below) targets
+  # this orchestrator. See README.md "Run manually" for the start-execution
+  # commands.
+  #
+  # Drives a FIXED, pre-defined SEQUENCE of cartography-okta-lambda-sync
+  # nested executions — one per split in the splits list (from SSM, or an
+  # explicit {"splits": [...]} override) — run strictly IN ORDER (a Map
+  # with MaxConcurrency: 1, which forces serial execution; a genuine
+  # sequential dependency chain, not a parallel fan-out — later splits'
+  # inputs depend on earlier splits' output update_tag). Each split's
+  # execution is a SEPARATE, independently-visible nested execution with
+  # its own distinct Step Functions input — unlike a Lambda-side runtime
+  # loop, this makes every invocation's actual payload directly visible via
+  # `describe-execution` on that specific nested execution ARN, no digging
+  # through parent-execution event history required.
+  #
+  # ANY nested execution failing (cartography-okta-lambda-sync's own Fail
+  # state, see that state machine's SyncFailed) propagates up and stops
+  # this orchestrator's execution immediately — no partial-success
+  # continuation to later splits, and critically, the
+  # "applications:cleanup" split is simply never reached if an earlier
+  # applications:<n>:<m> batch split failed (it is just the next array
+  # entry, so a Map abort means subsequent entries never run). See
+  # handler.py's module docstring "Why a batch failure must FAIL THE WHOLE
+  # RUN, not continue" for the full rationale — this was a deliberate,
+  # explicit design decision, not an oversight.
+  #
+  # Input options:
+  #   {}                       — full default run (reads the ordered
+  #                               splits list from
+  #                               /cartography/okta-lambda/default-splits)
+  #   {"splits": [{"steps": [...]}, ...]}
+  #                             — run exactly this ordered splits list
+  #                               instead (for a manual/debug run).
+  CartographyOktaLambdaOrchestratorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cartography-okta-lambda-orchestrator-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ReadDefaultSplits
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cartography/okta-lambda/default-splits"
+        - PolicyName: InvokeNestedSync
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref CartographyOktaLambdaStateMachine
+              - Effect: Allow
+                Action:
+                  - states:DescribeExecution
+                  - states:StopExecution
+                Resource: !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:cartography-okta-lambda-sync:*"
+              - Effect: Allow
+                Action:
+                  - events:PutTargets
+                  - events:PutRule
+                  - events:DescribeRule
+                Resource: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsForStepFunctionsExecutionRule"
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: "*"
+      Tags:
+        - Key: Project
+          Value: cartography
+
+  OrchestratorStateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /cartography/scheduler/okta-lambda-orchestrator
+      RetentionInDays: 30
+
+  CartographyOktaLambdaOrchestrator:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: cartography-okta-lambda-orchestrator
+      RoleArn: !GetAtt CartographyOktaLambdaOrchestratorRole.Arn
+      LoggingConfiguration:
+        Level: ERROR
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt OrchestratorStateMachineLogGroup.Arn
+      DefinitionSubstitutions:
+        SyncStateMachineArn: !Ref CartographyOktaLambdaStateMachine
+      Definition:
+        QueryLanguage: JSONata
+        Comment: >
+          Drives a FIXED, pre-defined sequence of cartography-okta-lambda-
+          sync nested executions, one per split (from SSM or an explicit
+          {"splits": [...]} override), strictly in order, threading one
+          shared update_tag through all of them. Any nested execution
+          failing stops the whole orchestrator run immediately. See
+          template.yaml's surrounding comments and README.md for the full
+          design.
+        StartAt: ResolveSplits
+        States:
+
+          # An explicit {"splits": [...]} input always wins; {} (or any
+          # input with no "splits" key) reads the default list from SSM.
+          #
+          # ALSO generates the one shared update_tag HERE, up front, before
+          # any split runs — NOT by threading a Step-Functions variable
+          # forward from one Map iteration's result to the next. Step
+          # Functions' own docs are explicit that this does NOT work the
+          # way an earlier draft of this template assumed: "Map iterations
+          # ... do not have access to variable values from other ...
+          # iterations" and "When a ... Map state completes, all of their
+          # variables will go out of scope" (AWS docs,
+          # "Passing data between states with variables" — variable
+          # scope section). A variable ASSIGNED inside one Map iteration is
+          # invisible to the next iteration and to the state after the Map
+          # — only OUTER-scope variables (assigned before the Map starts)
+          # are readable from inside each iteration via ItemSelector below.
+          # Generating the tag before the Map, once, sidesteps the need for
+          # any cross-iteration carry-forward entirely: every split's
+          # ItemSelector just reads the same already-known outer-scope
+          # $sharedUpdateTag. $floor($millis() / 1000) mirrors
+          # handler.py's own int(time.time()) (epoch SECONDS, not millis)
+          # exactly, so a tag generated here looks identical to one the
+          # Lambda would have generated itself on a non-orchestrated,
+          # single cartography-okta-lambda-sync call.
+          ResolveSplits:
+            Type: Choice
+            Choices:
+              - Condition: "{% $exists($states.input.splits) and $count($states.input.splits) > 0 %}"
+                Assign:
+                  splits: "{% $states.input.splits %}"
+                  sharedUpdateTag: "{% $floor($millis() / 1000) %}"
+                Next: RunSplits
+            Default: GetDefaultSplits
+
+          GetDefaultSplits:
+            Type: Task
+            Resource: arn:aws:states:::aws-sdk:ssm:getParameter
+            Arguments:
+              Name: /cartography/okta-lambda/default-splits
+            Assign:
+              splits: "{% $parse($states.result.Parameter.Value) %}"
+              sharedUpdateTag: "{% $floor($millis() / 1000) %}"
+            Output: {}
+            Next: RunSplits
+
+          # Serial Map (MaxConcurrency: 1) over the fixed splits list — NOT
+          # a parallel fan-out. Order matters: the applications batches/
+          # cleanup must run strictly in array order for cartography's own
+          # dependency-ordering reasons (see handler.py). MaxConcurrency: 1
+          # is what makes a Map state iterate strictly in order rather than
+          # concurrently — the same mechanism
+          # ../lambda-loader/template.yaml's own inner RunSplits Map uses
+          # to force serial per-account split execution. $sharedUpdateTag
+          # (an OUTER-scope variable, assigned above, before this Map
+          # starts) is readable from every iteration's ItemSelector below —
+          # see this state's preceding comment for why that is the correct
+          # mechanism here, not a per-iteration Assign carry-forward.
+          RunSplits:
+            Type: Map
+            Items: "{% $splits %}"
+            ItemSelector:
+              splitIndex: "{% $states.context.Map.Item.Index %}"
+              steps: "{% $states.context.Map.Item.Value.steps %}"
+              updateTag: "{% $sharedUpdateTag %}"
+            MaxConcurrency: 1
+            # $sharedUpdateTag is still readable here (RunSplits's own
+            # Output is evaluated in the OUTER scope, after the Map
+            # completes, not inside an iteration) — this is what makes the
+            # final orchestrator result report the one tag every split
+            # actually used, without needing to read it back out of any
+            # individual iteration's result.
+            Output:
+              status: SUCCEEDED
+              updateTag: "{% $sharedUpdateTag %}"
+              splitsCompleted: "{% $count($splits) %}"
+            ItemProcessor:
+              ProcessorConfig:
+                Mode: INLINE
+              StartAt: RunOneSplit
+              States:
+                # Synchronous nested execution (startExecution.sync:2 — the
+                # ":2" suffix returns JSON Output, not a string-escaped
+                # blob). This call BLOCKS until the nested
+                # cartography-okta-lambda-sync execution finishes, which,
+                # combined with MaxConcurrency: 1 above, is what makes the
+                # whole splits list run strictly in sequence.
+                RunOneSplit:
+                  Type: Task
+                  Resource: arn:aws:states:::states:startExecution.sync:2
+                  Arguments:
+                    StateMachineArn: "${SyncStateMachineArn}"
+                    # Execution name must be unique per invocation — Step
+                    # Functions rejects a duplicate name on the same state
+                    # machine within its execution-history retention
+                    # window. $states.context here refers to the
+                    # ORCHESTRATOR's own execution context (this Task runs
+                    # AS a state of the orchestrator's own state machine),
+                    # so $states.context.Execution.Name is the
+                    # orchestrator's own run ID. Only the first
+                    # hyphen-delimited segment is used so the console stays
+                    # scannable at a glance — same convention
+                    # ../lambda-loader/template.yaml's orchestrator uses
+                    # for its own nested execution names.
+                    Name: |-
+                      {%
+                        "okta-orch-"
+                        & $split($states.context.Execution.Name, "-")[0]
+                        & "-"
+                        & $string($states.input.splitIndex)
+                        & "-"
+                        & $string($millis())
+                      %}
+                    Input:
+                      steps: "{% $states.input.steps %}"
+                      # Every split uses the SAME tag, computed once by the
+                      # orchestrator's ResolveSplits/GetDefaultSplits
+                      # BEFORE this Map started (an outer-scope variable,
+                      # readable from every iteration's ItemSelector — see
+                      # this Map's own preceding comment for why this
+                      # replaces a broken earlier design that tried to
+                      # thread the tag iteration-to-iteration via Assign,
+                      # which Step Functions' own docs confirm does not
+                      # work across Map iterations).
+                      update_tag: "{% $states.input.updateTag %}"
+                  # Retry ONLY on Step-Functions-service-level failures for
+                  # STARTING the nested execution (throttling, transient
+                  # API errors) — NOT on the nested execution's own
+                  # reported failure, which already propagates as a Step
+                  # Functions execution FAILED status (via
+                  # cartography-okta-lambda-sync's SyncFailed Fail state)
+                  # and is caught below instead.
+                  Retry:
+                    - ErrorEquals:
+                        - StepFunctions.ExecutionLimitExceeded
+                        - StepFunctions.ServiceException
+                      IntervalSeconds: 2
+                      MaxAttempts: 3
+                      BackoffRate: 2
+                  Catch:
+                    - ErrorEquals: ["States.ALL"]
+                      Next: SplitFailed
+                      Assign:
+                        catchError: "{% $states.errorOutput %}"
+                  # Pass this state's OWN input through unchanged (NOT
+                  # Output: {}) — SplitComplete below needs
+                  # $states.input.splitIndex, which comes from THIS state's
+                  # input (set by the outer Map's ItemSelector), not from
+                  # anything startExecution.sync:2 itself returned. An
+                  # earlier version of this template used `Output: {}`
+                  # here (copied from a pattern elsewhere in this repo
+                  # where an Assign block captures everything needed into
+                  # variables first) — but this state's Catch/Assign only
+                  # captures catchError for the failure path, so on the
+                  # SUCCESS path `Output: {}` silently discarded
+                  # splitIndex entirely, which crashed SplitComplete with
+                  # States.QueryEvaluationError ("returned nothing
+                  # (undefined)") on every real run — confirmed by a live
+                  # execution failure, not a hypothetical.
+                  Output: "{% $states.input %}"
+                  Next: SplitComplete
+
+                SplitComplete:
+                  Type: Pass
+                  Output:
+                    splitIndex: "{% $states.input.splitIndex %}"
+                    status: SUCCEEDED
+                  End: true
+
+                # A genuine Fail state, not a Pass — propagates up through
+                # the Map and aborts the whole orchestrator execution. See
+                # this file's top-level comment above RunSplits for why a
+                # partial-success continuation here would be dangerous
+                # (the applications:cleanup split must never run if an
+                # earlier batch split failed).
+                SplitFailed:
+                  Type: Fail
+                  Error: OktaSplitFailed
+                  Cause: "{% $string($catchError) %}"
+            End: true
+
+  # ── Runtime-adjustable schedule (SSM) ───────────────────────────────────
+  # The EventBridge ScheduleExpression is resolved from this SSM parameter
+  # at deploy time via a {{resolve:ssm:...}} dynamic reference — same
+  # pattern the other loader stacks in this repo use. Change the
+  # schedule without editing the template:
+  #   aws ssm put-parameter --overwrite \
+  #     --name /cartography/okta-lambda/schedule --value 'cron(0 4 * * ? *)'
+  #   cd okta-lambda-loader && sam build && sam deploy
+  # NOTE: CloudFormation only sets this value on stack *create*; a later
+  # `sam deploy` will NOT overwrite an out-of-band change unless
+  # ScheduleDefault itself changed.
+  OktaLambdaScheduleParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /cartography/okta-lambda/schedule
+      Type: String
+      Value: !Ref ScheduleDefault
+      Description: >
+        EventBridge schedule expression for the daily
+        cartography-okta-lambda-orchestrator run. Resolved into the
+        schedule at deploy time.
+      Tags:
+        Project: cartography
+
+  # ── IAM role for EventBridge Scheduler ──────────────────────────────────
+  OktaLambdaSchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cartography-okta-lambda-scheduler-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StartOrchestratorStateMachine
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref CartographyOktaLambdaOrchestrator
+      Tags:
+        - Key: Project
+          Value: cartography
+
+  # ── EventBridge Scheduler ───────────────────────────────────────────────
+  # Triggers cartography-okta-lambda-orchestrator daily with input {} (the
+  # full default splits list from SSM — see DefaultSplitsJson).
+  CartographyOktaLambdaSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: cartography-okta-lambda-daily
+      Description: >
+        Triggers the daily cartography-okta-lambda-orchestrator run (full
+        default splits list).
+      ScheduleExpression: !Sub "{{resolve:ssm:${OktaLambdaScheduleParameter}}}"
+      ScheduleExpressionTimezone: UTC
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !Ref CartographyOktaLambdaOrchestrator
+        RoleArn: !GetAtt OktaLambdaSchedulerRole.Arn
+        Input: "{}"
+
+Outputs:
+  StateMachineArn:
+    Value: !Ref CartographyOktaLambdaStateMachine
+    Description: ARN of the single-task cartography-okta-lambda-sync Step Functions state machine
+  OrchestratorStateMachineArn:
+    Value: !Ref CartographyOktaLambdaOrchestrator
+    Description: ARN of the cartography-okta-lambda-orchestrator Step Functions state machine
+  FunctionArn:
+    Value: !GetAtt OktaLoaderFunction.Arn
+    Description: ARN of the Okta Lambda loader function
+  LambdaLogGroup:
+    Value: !Ref LambdaLogGroup
+    Description: CloudWatch log group for Lambda execution logs
+  StateMachineLogGroup:
+    Value: !Ref StateMachineLogGroup
+    Description: CloudWatch log group for cartography-okta-lambda-sync execution logs
+  OrchestratorStateMachineLogGroup:
+    Value: !Ref OrchestratorStateMachineLogGroup
+    Description: CloudWatch log group for cartography-okta-lambda-orchestrator execution logs
+  ScheduleName:
+    Value: !Ref CartographyOktaLambdaSchedule
+    Description: EventBridge schedule name for the daily orchestrator run

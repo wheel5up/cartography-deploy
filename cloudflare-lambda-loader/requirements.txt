@@ -1,0 +1,57 @@
+# Dependency set for the Cloudflare Lambda loader handler.
+#
+# This is NOT `pip install cartography` — that pulls the full pyproject.toml
+# dependency list (azure-mgmt-*, msgraph-sdk, oci, kubernetes, google-cloud-*,
+# boto3-heavy AWS submodule imports, etc. — every provider cartography
+# supports), which is unnecessary bloat for a Lambda that only ever imports
+# cartography.intel.cloudflare.
+#
+# Cartography's SOURCE (the `cartography/` package this handler needs) is
+# vendored separately at build time by the Makefile — see that file. Only
+# the runtime dependencies actually reached by cartography.intel.cloudflare's
+# imports (plus its own transitive chain through cartography.client.core.tx /
+# cartography.util) are listed here, same derivation method
+# ../okta-lambda-loader/requirements.txt and
+# ../vercel-lambda-loader/requirements.txt used.
+#
+# ALL VERSIONS ARE EXACT PINS (==), not floating minimums (>=). This is a
+# deliberate departure from every other loader's requirements.txt in this
+# repo (which all use >=): an unpinned `cloudflare>=4.1.0` in the fork's own
+# pyproject.toml let a routine fork-ref bump silently pull in
+# cloudflare-python 5.8.0, which renamed a kwarg and broke the Cloudflare
+# sync. Do not relax these to >= without checking the SDK's changelog
+# first.
+#
+# NOTE: cartography/util.py (imported transitively via
+# cartography.client.core.tx) imports boto3/botocore even though this
+# handler never calls any AWS API — util.py's AWS-pagination/retry helpers
+# are generic utilities cartography's core shares across all providers, not
+# Cloudflare-specific code. boto3/botocore are listed here for that reason,
+# confirmed by the same import-chain finding
+# ../okta-lambda-loader/requirements.txt documents for Okta.
+#
+# backoff is imported directly by both cartography/util.py and
+# cartography/client/core/tx.py (both transitively reached via
+# cartography.intel.cloudflare's own imports) — without it the Lambda fails
+# with ModuleNotFoundError: No module named 'backoff'.
+#
+# statsd is imported by cartography/stats.py (StatsClient), which both
+# cartography/util.py and cartography/client/core/tx.py import from
+# (get_stats_client / ScopedStatsClient) — without it the Lambda fails with
+# ModuleNotFoundError: No module named 'statsd'.
+#
+# cloudflare==5.7.0 predates that kwarg rename. This file is the only place
+# it's pinned: the fork's pyproject.toml still says cloudflare>=4.1.0, and
+# since the build vendors cartography's source rather than pip-installing
+# it, the version installed here is the one that runs. cloudflare's own
+# transitive deps (httpx, pydantic, anyio, distro, sniffio,
+# typing-extensions) are resolved automatically by pip from cloudflare's own
+# pinned requirement ranges — not re-pinned here, since they are the SDK's
+# concern, not cartography's or this handler's.
+
+boto3==1.40.61
+botocore==1.40.61
+neo4j==6.0.3
+cloudflare==5.7.0
+backoff==2.2.1
+statsd==4.0.1

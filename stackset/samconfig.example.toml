@@ -1,0 +1,30 @@
+# Copy to samconfig.toml (gitignored). Notes only; this stack is a StackSet.
+version = 0.1
+
+# This template is deployed as a SERVICE_MANAGED StackSet, NOT a plain stack.
+# Do not `sam deploy` it: that would create a separate single-account stack.
+#
+#   StackSet name: cartography-read-only
+#   Region:        us-east-1
+#   Account:       management account (<management-account-id>) or a delegated admin
+#
+# Update the StackSet (rolls out to every org account; new accounts auto-enroll):
+#   cd stackset
+#   aws cloudformation update-stack-set \
+#     --stack-set-name cartography-read-only \
+#     --template-body file://template.yaml \
+#     --parameters ParameterKey=HubAccountId,UsePreviousValue=true \
+#     --capabilities CAPABILITY_NAMED_IAM \
+#     --operation-preferences FailureToleranceCount=0,MaxConcurrentPercentage=25 \
+#     --region us-east-1
+#
+# Before updating, diff the live template against this repo to avoid
+# reverting an out-of-band change:
+#   aws cloudformation describe-stack-set --stack-set-name cartography-read-only \
+#     --region us-east-1 --query "StackSet.TemplateBody" --output text > /tmp/live.yaml
+#   diff /tmp/live.yaml template.yaml
+#
+# Track the rollout:
+#   aws cloudformation describe-stack-set-operation \
+#     --stack-set-name cartography-read-only --operation-id <OperationId> \
+#     --region us-east-1 --query "StackSetOperation.Status"

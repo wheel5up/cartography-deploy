@@ -1,0 +1,463 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Cartography - Kubernetes (EKS) Lambda Loader.
+  One Lambda invocation per EKS cluster: assume cartography-k8s-reader in the
+  cluster's account, mint an EKS token in-process, sync the cluster into Neo4j.
+  A Step Functions state machine fans out over the cluster list in
+  /cartography/k8s-scan/clusters (created by this stack). Independent of
+  ../lambda-loader.
+
+Parameters:
+  LambdaMemoryMb:
+    Type: Number
+    Default: 1024
+    Description: >
+      1024MB gives more CPU for JSON transform of large pod lists.
+
+  LambdaTimeoutSeconds:
+    Type: Number
+    Default: 900
+    MaxValue: 900
+
+  ReaderRoleName:
+    Type: String
+    Default: cartography-k8s-reader
+    Description: >
+      Per-account role bound to the cluster's
+      cartography-readonly group via an EKS Access Entry. Its trust policy
+      must list cartography-k8s-lambda-role, or (interim) IntermediateRoleName.
+
+  IntermediateRoleName:
+    Type: String
+    Default: ""
+    Description: >
+      Optional. Same-account role the Lambda assumes first, then assumes the
+      reader from. Use it when cartography-k8s-reader trusts some other role
+      instead of cartography-k8s-lambda-role; that role's trust policy must
+      allow cartography-k8s-lambda-role. Leave "" for the direct path.
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC that Neo4j and the loaders run in.
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Private subnet with outbound internet (NAT), same VPC as Neo4j.
+
+  MaxConcurrency:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 40
+    Description: Max clusters synced in parallel.
+
+  ScheduleDefault:
+    Type: String
+    Default: "cron(0 5 * * ? *)"
+    Description: >
+      Deploy-time seed for /cartography/k8s-lambda/schedule (05:00 UTC).
+
+  ScheduleState:
+    Type: String
+    Default: DISABLED
+    AllowedValues: [ENABLED, DISABLED]
+    Description: >
+      Ships DISABLED. Flip to ENABLED once a manual run succeeds.
+
+  DefaultClustersJson:
+    Type: String
+    Default: "[]"
+    Description: >
+      Deploy-time seed for the SSM parameter /cartography/k8s-scan/clusters, a
+      JSON array of EKS cluster ARNs to sync when no {"clusters": [...]}
+      execution input is given. Each cluster needs a cartography-k8s-reader
+      role and an EKS Access Entry. CloudFormation only seeds this on stack
+      create; update it later with `aws ssm put-parameter --overwrite`.
+
+Conditions:
+  UseIntermediateRole: !Not [!Equals [!Ref IntermediateRoleName, ""]]
+
+Resources:
+
+  # ── Runtime-adjustable cluster list (SSM) ─────────────────────────────────
+  # CloudFormation only sets this value on create; a later `sam deploy` will
+  # NOT overwrite an out-of-band change, so runtime edits survive redeploys.
+  ClustersParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /cartography/k8s-scan/clusters
+      Type: String
+      Value: !Ref DefaultClustersJson
+      Description: >
+        JSON array of EKS cluster ARNs to sync. Read at runtime by the
+        cartography-k8s-lambda-sync state machine when no execution input is given.
+      Tags:
+        Project: cartography
+
+  # ── Networking ──────────────────────────────────────────────────────────
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: cartography-k8s-lambda-loader-sg
+      GroupDescription: Cartography K8s Lambda loader - outbound only
+      VpcId: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value: cartography-k8s-lambda-loader-sg
+        - Key: Project
+          Value: cartography
+
+  LambdaEgressHttps:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref LambdaSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: 0.0.0.0/0
+      Description: Outbound HTTPS (AWS APIs, STS, EKS API endpoints)
+
+  LambdaEgressNeo4jBolt:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref LambdaSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8443
+      ToPort: 8443
+      DestinationSecurityGroupId: "{{resolve:ssm:/cartography/sg/neo4j}}"
+      Description: Bolt 8443 to Neo4j
+
+  Neo4jIngressFromLambda:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: "{{resolve:ssm:/cartography/sg/neo4j}}"
+      IpProtocol: tcp
+      FromPort: 8443
+      ToPort: 8443
+      SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      Description: Bolt 8443 from Cartography K8s Lambda loader
+
+  # ── Lambda execution role ──────────────────────────────────────────────
+  # Fixed name + Retain: the cartography-k8s-reader trust policy in every
+  # spoke account references this role. IAM pins trust to the role's unique
+  # ID, so deleting/recreating it silently breaks trust until Terraform is
+  # re-applied. Retain keeps a stack delete from doing that.
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RoleName: cartography-k8s-lambda-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: ReadNeo4jPassword
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cartography/neo4j/password"
+        - PolicyName: AssumeK8sReader
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: sts:AssumeRole
+                Resource: !Sub "arn:aws:iam::*:role/${ReaderRoleName}"
+              - !If
+                - UseIntermediateRole
+                - Effect: Allow
+                  Action: sts:AssumeRole
+                  Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/${IntermediateRoleName}"
+                - !Ref AWS::NoValue
+        - PolicyName: PutSyncMetrics
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: Cartography
+      Tags:
+        - Key: Project
+          Value: cartography
+
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /cartography/k8s-lambda-loader
+      RetentionInDays: 30
+
+  K8sLoaderFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: cartography-k8s-lambda-loader
+      Handler: handler.handler
+      Runtime: python3.13
+      Architectures: [x86_64]
+      CodeUri: .
+      MemorySize: !Ref LambdaMemoryMb
+      Timeout: !Ref LambdaTimeoutSeconds
+      Role: !GetAtt LambdaExecutionRole.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref SubnetId
+      LoggingConfig:
+        LogGroup: !Ref LambdaLogGroup
+      Environment:
+        Variables:
+          NEO4J_URI: "bolt://{{resolve:ssm:/cartography/neo4j/private-ip}}:8443"
+          NEO4J_PASSWORD_SSM_PARAM: /cartography/neo4j/password
+          NEO4J_MAX_CONNECTION_LIFETIME: "200"
+          READER_ROLE_NAME: !Ref ReaderRoleName
+          INTERMEDIATE_ROLE_ARN: !If
+            - UseIntermediateRole
+            - !Sub "arn:aws:iam::${AWS::AccountId}:role/${IntermediateRoleName}"
+            - ""
+          ASSUME_ROLE_DURATION_SECONDS: "900"
+          METRICS_REGION: !Ref AWS::Region
+          METRICS_NAMESPACE: Cartography
+      Tags:
+        Project: cartography
+
+  # ── State machine ──────────────────────────────────────────────────────
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cartography-k8s-lambda-statemachine-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeLoader
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt K8sLoaderFunction.Arn
+        - PolicyName: ReadClusterList
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cartography/k8s-scan/clusters"
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: "*"
+      Tags:
+        - Key: Project
+          Value: cartography
+
+  StateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /cartography/scheduler/k8s-lambda
+      RetentionInDays: 30
+
+  # Input:
+  #   {}                                        — clusters from SSM
+  #   {"clusters": ["arn:aws:eks:...", ...]}    — exactly that list
+  # Every cluster runs (one failure doesn't stop the others); the execution
+  # ends FAILED if any cluster failed, so a bad night is a red execution, not
+  # a green one with failures buried in the output.
+  K8sLambdaStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: cartography-k8s-lambda-sync
+      RoleArn: !GetAtt StateMachineRole.Arn
+      LoggingConfiguration:
+        Level: ERROR
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StateMachineLogGroup.Arn
+      DefinitionSubstitutions:
+        LoaderFunctionArn: !GetAtt K8sLoaderFunction.Arn
+        MaxConcurrency: !Ref MaxConcurrency
+      Definition:
+        QueryLanguage: JSONata
+        Comment: Sync every EKS cluster in the list via cartography-k8s-lambda-loader.
+        StartAt: CheckInputClusters
+        States:
+
+          CheckInputClusters:
+            Type: Choice
+            Choices:
+              - Condition: "{% $count($states.input.clusters ? $states.input.clusters : []) > 0 %}"
+                Assign:
+                  clusters: "{% $append([], $states.input.clusters) %}"
+                Next: SyncClusters
+            Default: GetDefaultClusters
+
+          GetDefaultClusters:
+            Type: Task
+            Resource: arn:aws:states:::aws-sdk:ssm:getParameter
+            Arguments:
+              Name: /cartography/k8s-scan/clusters
+            Assign:
+              clusters: "{% $append([], $parse($states.result.Parameter.Value)) %}"
+            Output: {}
+            Next: SyncClusters
+
+          SyncClusters:
+            Type: Map
+            Items: "{% $clusters %}"
+            # JSONata state machines need numeric substitutions wrapped as a
+            # JSONata literal (see ../lambda-loader/README.md). cfn-lint flags
+            # this (E3601) as a false positive; `sam validate` without --lint
+            # passes, and Step Functions accepts it.
+            MaxConcurrency: "{% ${MaxConcurrency} %}"
+            ItemProcessor:
+              ProcessorConfig:
+                Mode: INLINE
+              StartAt: SyncCluster
+              States:
+                SyncCluster:
+                  Type: Task
+                  Resource: arn:aws:states:::lambda:invoke
+                  Arguments:
+                    FunctionName: "${LoaderFunctionArn}"
+                    Payload:
+                      cluster_arn: "{% $states.input %}"
+                  Retry:
+                    - ErrorEquals:
+                        - Lambda.ServiceException
+                        - Lambda.AWSLambdaException
+                        - Lambda.SdkClientException
+                        - Lambda.TooManyRequestsException
+                      IntervalSeconds: 2
+                      MaxAttempts: 3
+                      BackoffRate: 2
+                  Catch:
+                    - ErrorEquals: ["States.ALL"]
+                      Output:
+                        clusterArn: "{% $states.input %}"
+                        status: FAILED
+                        error: "{% $string($states.errorOutput) %}"
+                      Next: ClusterInvokeFailed
+                  Output: "{% $states.result.Payload %}"
+                  End: true
+                # Lambda-level failure (timeout, OOM). Recorded as a FAILED
+                # result; the Map keeps going for the other clusters.
+                ClusterInvokeFailed:
+                  Type: Pass
+                  End: true
+            Assign:
+              results: "{% $append([], $states.result) %}"
+              failed: "{% $append([], $states.result[status != 'SUCCEEDED'].clusterArn) %}"
+            Output: {}
+            Next: EvalResults
+
+          EvalResults:
+            Type: Choice
+            Choices:
+              - Condition: "{% $count($failed) > 0 %}"
+                Next: SomeClustersFailed
+            Default: AllClustersSucceeded
+
+          AllClustersSucceeded:
+            Type: Succeed
+            Output:
+              succeededCount: "{% $count($results) %}"
+              failedCount: 0
+              results: "{% $results %}"
+
+          SomeClustersFailed:
+            Type: Fail
+            Error: ClusterSyncFailed
+            Cause: "{% $count($failed) & ' of ' & $count($results) & ' cluster(s) failed: ' & $join($failed, ', ') %}"
+
+  # ── Schedule ───────────────────────────────────────────────────────────
+  ScheduleParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /cartography/k8s-lambda/schedule
+      Type: String
+      Value: !Ref ScheduleDefault
+      Description: Schedule expression for cartography-k8s-lambda-daily (resolved at deploy time).
+      Tags:
+        Project: cartography
+
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cartography-k8s-lambda-scheduler-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StartStateMachine
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref K8sLambdaStateMachine
+      Tags:
+        - Key: Project
+          Value: cartography
+
+  DailySchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: cartography-k8s-lambda-daily
+      Description: Daily cartography-k8s-lambda-sync run over /cartography/k8s-scan/clusters.
+      ScheduleExpression: !Sub "{{resolve:ssm:${ScheduleParameter}}}"
+      ScheduleExpressionTimezone: UTC
+      State: !Ref ScheduleState
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !Ref K8sLambdaStateMachine
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: "{}"
+
+Outputs:
+  StateMachineArn:
+    Value: !Ref K8sLambdaStateMachine
+  FunctionArn:
+    Value: !GetAtt K8sLoaderFunction.Arn
+  LambdaRoleArn:
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Description: Add this ARN to the reader role's trust policy in each cluster account.
+  LambdaLogGroup:
+    Value: !Ref LambdaLogGroup
+  ScheduleName:
+    Value: !Ref DailySchedule

@@ -1,0 +1,24 @@
+# Runtime deps for the GitHub Lambda loader. NOT `pip install cartography` —
+# the full pyproject pulls every provider SDK. cartography's source is vendored
+# by the Makefile from the pinned fork tag.
+#
+# Derived from the third-party imports in cartography/intel/github/*.py plus
+# what cartography core (util, client.core.tx, graph, stats) imports
+# transitively. boto3 is needed both for SSM and because cartography/util.py
+# imports it at module level.
+boto3>=1.40.0
+neo4j>=6.0.0
+requests>=2.32.0
+PyJWT[crypto]>=2.8.0
+PyYAML>=6.0
+packaging>=24.0
+python-dateutil>=2.9.0
+backoff>=2.1.2
+statsd>=4.0.0
+# repos.py imports cartography.intel.trivy.util (purl helpers) -> packageurl.
+# Importing that package runs cartography/intel/trivy/__init__.py, which imports
+# intel/common/object_store.py -> azure.storage.blob at module level. Never
+# called by the GitHub sync; needed only so the import chain doesn't fail.
+# Found by import-testing the built artifact in public.ecr.aws/lambda/python:3.13.
+packageurl-python>=0.15.0
+azure-storage-blob>=12.19.0

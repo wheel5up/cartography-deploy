@@ -1,0 +1,17 @@
+# Runtime deps for the ontology Lambda loader. NOT `pip install cartography`;
+# cartography's source is vendored by the Makefile from the pinned fork tag.
+#
+# Derived by walking every import reachable from cartography.intel.ontology
+# (rc18): backoff, boto3/botocore, neo4j, packageurl (packages sync), statsd.
+# No provider SDK: ontology reads only what other loaders already wrote to
+# Neo4j. boto3 is needed because cartography/util.py imports it at module level.
+boto3>=1.40.0
+neo4j>=6.0.0
+backoff>=2.1.2
+statsd>=4.0.0
+packageurl-python>=0.15.0
+# ontology/packages.py imports cartography.intel.trivy.util, and importing the
+# trivy package runs intel/common/object_store.py -> azure.storage.blob at
+# module level. Never called here; needed only so the import chain doesn't
+# fail. Same workaround ../github-lambda-loader/requirements.txt documents.
+azure-storage-blob>=12.19.0
