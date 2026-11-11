@@ -24,9 +24,8 @@ variable "aws_account_id" {
 }
 
 variable "aws_lambda_role_name" {
-  description = "IAM role of the GCP loader Lambda (created by gcp-lambda-loader/template.yaml)."
+  description = "IAM role of the GCP loader Lambda: cartography-gcp-lambda-loader-role-<region> (created by gcp-lambda-loader/template.yaml)."
   type        = string
-  default     = "cartography-gcp-lambda-loader-role"
 }
 
 variable "org_roles" {
@@ -44,7 +43,7 @@ variable "org_roles" {
     "roles/notebooks.viewer",
     "roles/serviceusage.apiKeysViewer",
     "roles/bigquery.metadataViewer", # datasets/tables/routines, no table data
-    # BigQuery connections: custom role "cartographyBigQueryConnectionViewer" (main.tf)
+    # BigQuery connections: custom role "cartographyBqConnectionMetadataViewer" (main.tf)
     # Deliberately omitted (grant data/usage access, not just metadata):
     #   roles/bigquery.dataViewer      - can read table contents
     #   roles/bigquery.connectionUser  - includes bigquery.connections.use

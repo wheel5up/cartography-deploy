@@ -81,7 +81,7 @@ resource "google_organization_iam_member" "reader" {
 resource "google_organization_iam_custom_role" "bq_connection_viewer" {
   for_each    = var.scanned_org_ids
   org_id      = each.value
-  role_id     = "cartographyBigQueryConnectionViewer"
+  role_id     = "cartographyBqConnectionMetadataViewer"
   title       = "Cartography BigQuery Connection Viewer"
   description = "List/get BigQuery connections metadata. No use."
   permissions = [

@@ -4,6 +4,8 @@ host_org_id     = "123456789012"
 billing_account = "000000-000000-000000"
 aws_account_id  = "111111111111"
 
+aws_lambda_role_name = "cartography-gcp-lambda-loader-role-us-east-1"
+
 scanned_org_ids = {
   "example.com" = "123456789012"
 }
